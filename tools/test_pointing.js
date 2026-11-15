@@ -518,5 +518,44 @@ console.log('\n[6] decimal fields: editable, synced with sexagesimal (round-1 fe
   check('Dec 91 decimal rejected', state.obs.decDeg, -42.25, 1e-9, 'deg');
 }
 
+// ---------------------------------------------------------------- rotation
+console.log('\n[7] rotation: number box and 0–360° slider drive one angle (round 25)');
+{
+  const slide = $('pnt-rot-slide');
+  ok('the Rot row has a slider from 0 to 360 in whole degrees',
+    !!slide && slide.attrs.type === 'range' && slide.attrs.min === '0' &&
+    slide.attrs.max === '360' && slide.attrs.step === '1', slide && JSON.stringify(slide.attrs));
+  const slideTo = (v) => { slide.value = String(v); slide.dispatchEvent({ type: 'input' }); };
+
+  slideTo(137);
+  eq('dragging the slider sets obs.rotDeg', state.obs.rotDeg, 137);
+  eq('the number box follows the slider', $('pnt-rot').value, '137');
+
+  type('pnt-rot', '45.25');
+  check('a typed fraction is kept in state', state.obs.rotDeg, 45.25, 1e-12, 'deg');
+  eq('the slider follows the number box, to the degree', slide.value, '45');
+
+  type('pnt-rot', '-90');
+  eq('a negative angle wraps, and the slider shows it in 0–360', slide.value, '270');
+  eq('state holds the wrapped angle', state.obs.rotDeg, 270);
+
+  slideTo(360);
+  eq('the right-hand end is 360° = 0° in state', state.obs.rotDeg, 0);
+  eq('the thumb stays at the end it was pushed to', slide.value, '360');
+  eq('the number box reads 0', $('pnt-rot').value, '0');
+  slideTo(359);
+  eq('and comes back off the end normally', state.obs.rotDeg, 359);
+  state.setObs({ rotDeg: 0 });
+  SAT.ui.pointing.refresh();
+  eq('an angle set elsewhere moves the thumb', slide.value, '0');
+
+  slideTo(12);
+  type('pnt-rot', '400');
+  eq('an out-of-range typed angle is rejected and the slider is untouched', slide.value, '12');
+  eq('state unchanged by the rejected entry', state.obs.rotDeg, 12);
+  state.setObs({ rotDeg: 0 });
+  SAT.ui.pointing.refresh();
+}
+
 console.log(failures ? `\n${failures} FAILURE(S)\n` : '\nall checks passed\n');
 process.exit(failures ? 1 : 0);

@@ -48,9 +48,8 @@
         'The frame is your image; names sit outside it at each trail’s end. Ticks along a ' +
         'trail are round UTC instants — hover or click a trail anywhere along its length ' +
         'to read them, with entry and exit times. A dashed trail is in the Earth’s shadow ' +
-        'and cannot be an optical streak. The strip under the chart is the scan window: ' +
-        'one bar per crossing; drag it to move the clock, click a bar to jump to that ' +
-        'object’s closest approach. Ruler (R): drag along a streak to get its length and ' +
+        'and cannot be an optical streak. The strip under the chart is a time slider over ' +
+        'the scan window: press or drag it to move the clock. Ruler (R): drag along a streak to get its length and ' +
         'position angle and the predicted trails that match it best. On a parked mount ' +
         'the stars trail over the exposure, as they do in the frame. Hover a star for its ' +
         'V magnitude. Wheel zooms, drag pans, double-click re-aims, F fits, Esc clears.']),

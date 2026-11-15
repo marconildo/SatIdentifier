@@ -743,7 +743,7 @@ console.log('\n[14] satLabel — marker label format (round 20)');
 }
 
 // ---------------------------------------------------------------- test 15
-console.log('\n[15] round 22 — trail ticks, timeline axis, lanes, ruler (pure helpers)');
+console.log('\n[15] round 22 — trail ticks, timeline axis, ruler (pure helpers)');
 {
   // ticks: the finest interval that keeps them >= 26 px apart
   ok('2 s streak 700 px long is ticked in tenths', C.tickStepS(700, 2) === 0.1, String(C.tickStepS(700, 2)));
@@ -766,13 +766,7 @@ console.log('\n[15] round 22 — trail ticks, timeline axis, lanes, ruler (pure 
   ok('30 min window, 1000 px -> 5 min ticks', C.timelineStepS(1800, 1000) === 300, String(C.timelineStepS(1800, 1000)));
   ok('24 h window, 1000 px -> 3 h ticks', C.timelineStepS(86400, 1000) === 10800, String(C.timelineStepS(86400, 1000)));
 
-  // lanes: no overlap while lanes are free, then the lane that frees first
-  const lanes = C.packLanes([{ x0: 0, x1: 50 }, { x0: 10, x1: 20 }, { x0: 30, x1: 40 }, { x0: 60, x1: 70 }], 4, 1);
-  ok('overlapping bars go to separate lanes, freed lanes are reused',
-    JSON.stringify(lanes) === '[0,1,1,0]', JSON.stringify(lanes));
-  const full = C.packLanes([{ x0: 0, x1: 50 }, { x0: 1, x1: 30 }, { x0: 2, x1: 40 }], 2, 1);
-  ok('with every lane busy, the one that frees first is doubled up',
-    JSON.stringify(full) === '[0,1,1]', JSON.stringify(full));
+  ok('round 25: the timeline has no crossing bars, so no lane packer', C.packLanes === undefined);
 
   // ruler: a streak has no direction — angles compare modulo 180
   ok('angle difference is modulo 180', C.lineAngleDiff(10, 190) === 0 && C.lineAngleDiff(350, 10) === 20 &&
@@ -896,13 +890,51 @@ console.log('\n[16] round 22 — names never overlap; hover, click, ruler and ti
     rulerText.slice(0, 150));
   fire(cv, 'keydown', { key: 'Escape' });
 
-  // timeline: a press on empty time scrubs the clock into the scan window
-  fire(tcv, 'mousedown', { clientX: 455, clientY: 4 });
+  // timeline (round 25): a plain time slider — axis and thumb, no crossing bars.
+  // The strip is 900 px wide here with the track from x = 12 to 888, over 60 s.
+  const tAt = (x) => T0 + (x - 12) / 876 * 60000;
+  fire(tcv, 'mousedown', { clientX: 450, clientY: 4 });
   ok('pressing the timeline moves the clock inside the scan window',
     clockSet != null && clockSet >= T0 && clockSet <= T0 + 60000,
     clockSet == null ? 'clock not set' : `+${((clockSet - T0) / 1000).toFixed(1)} s`);
   ok('half way along the strip is half way through the span',
-    clockSet != null && Math.abs(clockSet - (T0 + 30000)) < 1500);
+    clockSet != null && Math.abs(clockSet - (T0 + 30000)) < 2);
+  fire(global, 'mousemove', { clientX: 231, clientY: 60 });
+  ok('dragging carries the thumb, even with the pointer off the strip',
+    Math.abs(clockSet - tAt(231)) < 2, `+${((clockSet - T0) / 1000).toFixed(2)} s`);
+  fire(global, 'mousemove', { clientX: 5000, clientY: 20 });
+  ok('a drag past the end stops at the end of the window', clockSet === T0 + 60000);
+  fire(global, 'mouseup', {});
+  clockSet = null;
+  fire(global, 'mousemove', { clientX: 300, clientY: 20 });
+  ok('after release the pointer no longer moves the clock', clockSet === null);
+
+  // where FAN-OBJECT-2's bar used to be (8–11 s, on the lane rows): a press there
+  // is a time, not an object
+  selected = 'unset';
+  fire(tcv, 'mousedown', { clientX: 151, clientY: 22 });
+  fire(global, 'mouseup', {});
+  ok('a press on the strip never selects an object', selected === 'unset' &&
+    Math.abs(clockSet - tAt(151)) < 2 && Math.abs(clockSet - FAN[2].tCaMs) > 20,
+    `selected ${selected}, clock +${((clockSet - T0) / 1000).toFixed(2)} s`);
+  const rects0 = calls.fillRect || 0, strokes0 = calls.strokeRect || 0;
+  texts.length = 0;
+  C.requestRender();
+  const tlLabels = texts.filter((q) => /^\d\d:\d\d:\d\d$/.test(q.t));
+  ok('the axis is labelled at round UTC instants', tlLabels.length >= 5 &&
+    tlLabels.every((q) => /:\d0$/.test(q.t)), tlLabels.map((q) => q.t).join(' '));
+  ok('no per-crossing bars are painted (12 crossings, a handful of rectangles)',
+    (calls.fillRect || 0) - rects0 < 12, `${(calls.fillRect || 0) - rects0} fillRect, ${(calls.strokeRect || 0) - strokes0} strokeRect`);
+
+  // a stale scan is said in words on the status line (it used to be on the strip)
+  const staleEl = created.find((e) => e.className === 'chart-stale');
+  ok('fresh scan: no stale note', !!staleEl && !staleEl.textContent, staleEl && String(staleEl.textContent));
+  SAT.state.scan.stale = true;
+  C.requestRender();
+  ok('stale scan: the status line says to re-run', /re-run/.test(String(staleEl.textContent)),
+    String(staleEl.textContent));
+  SAT.state.scan.stale = false;
+  C.requestRender();
 }
 
 // ---------------------------------------------------------------- test 17

@@ -22,7 +22,8 @@
  *
  * ROUND 22 — the panel was redesigned around one job: HOLD THIS AGAINST A FRAME.
  *   - The window is four stacked parts, none overlapping the sky: a labelled
- *     toolbar, the chart, a TIMELINE of the scan window, and a status line.
+ *     toolbar, the chart, a TIME SLIDER over the scan window, and a status line.
+ *     (Round 25: the slider lost its per-crossing colour bars — axis and thumb only.)
  *   - The field interior carries only what the image carries — stars and trails.
  *     Object names sit OUTSIDE the frame at each trail's end, placed so they never
  *     overlap; RA/Dec labels sit where each grid line leaves the frame.
@@ -45,7 +46,6 @@
   var view = { zoom: 1, panX: 0, panY: 0 };   // zoom is relative to the fit scale
   var markerHits = [];                        // [{id, x, y}]
   var trails = [];                            // this frame's in-field trails, in screen px
-  var tlHits = [];                            // timeline bars [{id, x0, x1, y0, y1}]
   var tlRange = null;                         // {t0, t1, x0, x1} of the drawn timeline
   var labelBoxes = [];                        // rectangles already taken by text this frame
   var hover = { id: null, t: null };          // crossing under the cursor, and WHEN on its trail
@@ -53,10 +53,10 @@
   // Ruler end points are SKY positions, so the line stays on its stars under
   // zoom, pan and a running clock.
   var ruler = { on: false, a: null, b: null, dragging: false };
-  var elHud = null, elCursor = null, elTip = null, elRuler = null, elZoom = null;
+  var elHud = null, elStale = null, elCursor = null, elTip = null, elRuler = null, elZoom = null;
   var elPop = null, elMag = null, elMagAuto = null, elMirror = null;
   var toolBtns = {}, layerChecks = {};
-  var drag = null, tlDrag = null;
+  var drag = null, tlDrag = null, tlHover = false;
 
   // Star cone results. Re-queried only when the tangent point or the view radius
   // moves by more than 10% of the field — a cone query walks 130k stars, and doing
@@ -1844,39 +1844,30 @@
     return TL_STEPS[TL_STEPS.length - 1];
   }
 
-  /** Assign bars to lanes so that no two in a lane overlap, reusing lanes
-   *  cyclically once `nLanes` are full. `bars` = [{x0, x1}] sorted by x0; returns
-   *  the lane index of each. Pure; unit-tested. */
-  function packLanes(bars, nLanes, gapPx) {
-    var ends = [], out = [];
-    for (var i = 0; i < bars.length; i++) {
-      var lane = -1;
-      for (var k = 0; k < ends.length; k++) {
-        if (ends[k] + gapPx <= bars[i].x0) { lane = k; break; }
-      }
-      if (lane < 0) {
-        if (ends.length < nLanes) { lane = ends.length; ends.push(-Infinity); }
-        else {
-          lane = 0;                                  // full: the lane that frees first
-          for (var q = 1; q < ends.length; q++) if (ends[q] < ends[lane]) lane = q;
-        }
-      }
-      ends[lane] = Math.max(ends[lane], bars[i].x1);
-      out.push(lane);
-    }
-    return out;
+  /** Layout of the strip, CSS px from its top: tick labels, tick marks, then the
+   *  slider's track with its thumb. */
+  var TL_LABEL_Y = 7, TL_TICK_Y0 = 14, TL_TRACK_Y = 25, TL_TRACK_H = 4, TL_THUMB_R = 6;
+
+  function roundBar(c, x, y, w, h) {
+    var r = h / 2;
+    c.beginPath();
+    c.moveTo(x + r, y);
+    c.lineTo(x + w - r, y);
+    c.arc(x + w - r, y + r, r, -Math.PI / 2, Math.PI / 2);
+    c.lineTo(x + r, y + h);
+    c.arc(x + r, y + r, r, Math.PI / 2, Math.PI * 1.5);
+    c.closePath();
   }
 
-  /** The scan window as a strip: one bar per crossing from entry to exit, coloured
-   *  by type, and the clock as a playhead. WHEN is half of an identification, and
-   *  the chart alone only shows where. Click or drag to move the clock; click a
-   *  bar to select that object and jump to its closest approach. */
-  function drawTimeline(list, nowMs) {
+  /** The scan window as a time slider: a UTC axis over a track, the clock as the
+   *  thumb. Press or drag anywhere on the strip to move the clock. (Round 25: the
+   *  per-crossing colour bars are gone — the strip is the time control and
+   *  nothing else; the crossings are on the chart and in the Crossings table.) */
+  function drawTimeline(nowMs) {
     if (!tctx || tlW < 2 || tlH < 2) return;
     tctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     tctx.fillStyle = '#0c1116';
     tctx.fillRect(0, 0, tlW, tlH);
-    tlHits = [];
     tlRange = null;
     var sc = SAT.state.scan, pr = sc && sc.params;
     tctx.font = '10px ' + MONO;
@@ -1884,89 +1875,84 @@
     if (!pr || pr.t0Ms == null || !(pr.spanMin > 0)) {
       tctx.fillStyle = '#6b7783';
       tctx.textAlign = 'center';
-      tctx.fillText('timeline — run a scan to see when each object crosses the field', tlW / 2, tlH / 2);
+      tctx.fillText('time slider — run a scan to step through its window', tlW / 2, tlH / 2);
       tctx.textAlign = 'left';
       return;
     }
     var t0 = pr.t0Ms, t1 = t0 + pr.spanMin * 60000;
-    var x0 = 10, x1 = Math.max(x0 + 10, tlW - 10);
+    var x0 = 12, x1 = Math.max(x0 + 10, tlW - 12);
     var X = function (tm) { return x0 + (tm - t0) / (t1 - t0) * (x1 - x0); };
     tlRange = { t0: t0, t1: t1, x0: x0, x1: x1 };
     var p2 = SAT.util.pad2;
+    var stale = !!sc.stale;
+    var yT = TL_TRACK_Y, yTop = yT - TL_TRACK_H / 2;
 
-    // axis: round UTC instants
+    // the clock: outside the window the thumb parks at that end, hollow
+    var xp = X(nowMs), out = xp < x0 ? -1 : (xp > x1 ? 1 : 0);
+    xp = SAT.util.clamp(xp, x0, x1);
+
+    // track, with the elapsed part filled
+    tctx.fillStyle = 'rgba(154,164,174,0.22)';
+    roundBar(tctx, x0, yTop, x1 - x0, TL_TRACK_H);
+    tctx.fill();
+    if (xp - x0 > TL_TRACK_H) {
+      tctx.fillStyle = stale ? 'rgba(255,184,79,0.45)' : 'rgba(79,195,247,0.55)';
+      roundBar(tctx, x0, yTop, xp - x0, TL_TRACK_H);
+      tctx.fill();
+    }
+
+    // axis: round UTC instants, ticks standing on the track
     var spanS = (t1 - t0) / 1000;
     var step = timelineStepS(spanS, x1 - x0) * 1000;
-    tctx.strokeStyle = 'rgba(154,164,174,0.35)';
+    tctx.strokeStyle = 'rgba(154,164,174,0.45)';
     tctx.fillStyle = '#8b97a3';
     tctx.lineWidth = 1;
+    tctx.textAlign = 'center';
     tctx.beginPath();
-    tctx.moveTo(x0, 13.5); tctx.lineTo(x1, 13.5);
     for (var tk = Math.ceil(t0 / step) * step; tk <= t1; tk += step) {
       var xt = Math.round(X(tk)) + 0.5;
-      tctx.moveTo(xt, 10); tctx.lineTo(xt, 16);
+      tctx.moveTo(xt, TL_TICK_Y0); tctx.lineTo(xt, yTop - 1);
       var d = new Date(tk);
       var lab = p2(d.getUTCHours()) + ':' + p2(d.getUTCMinutes()) +
         (step < 60000 ? ':' + p2(d.getUTCSeconds()) : '');
+      // a label at either end of the window is nudged inward rather than dropped
       var lw = tctx.measureText(lab).width;
-      if (xt - lw / 2 > 2 && xt + lw / 2 < tlW - 2) {
-        tctx.textAlign = 'center';
-        tctx.fillText(lab, xt, 5);
-      }
+      tctx.fillText(lab, SAT.util.clamp(xt, lw / 2 + 3, tlW - lw / 2 - 3), TL_LABEL_Y);
     }
     tctx.stroke();
-    tctx.textAlign = 'left';
 
-    // bars
-    var selId = SAT.state.selection ? SAT.state.selection.satId : null;
-    var top = 19, laneH = 4, gap = 2;
-    var nL = Math.max(1, Math.floor((tlH - top - 2) / (laneH + gap)));
-    var bars = [];
-    for (var i = 0; i < list.length; i++) {
-      var cr = list[i];
-      if (cr.tEnterMs == null || cr.tExitMs == null) continue;
-      var xa = X(cr.tEnterMs), xb = Math.max(xa + 3, X(cr.tExitMs));
-      bars.push({ cr: cr, x0: xa, x1: xb });
-    }
-    bars.sort(function (u, v) { return u.x0 - v.x0; });
-    var lanes = packLanes(bars, nL, 1);
-    var stale = !!(sc && sc.stale);
-    for (i = 0; i < bars.length; i++) {
-      var b = bars[i], y = top + lanes[i] * (laneH + gap);
-      var hot = b.cr.satId === selId || b.cr.satId === hover.id;
-      tctx.fillStyle = hexA(typeColorOf(b.cr), stale ? 0.35 : (hot ? 1 : 0.8));
-      tctx.fillRect(b.x0, y, b.x1 - b.x0, laneH);
-      if (hot) {
-        tctx.strokeStyle = '#ffffff';
-        tctx.lineWidth = 1;
-        tctx.strokeRect(b.x0 - 1, y - 1, b.x1 - b.x0 + 2, laneH + 2);
-      }
-      tlHits.push({ id: b.cr.satId, cr: b.cr, x0: b.x0 - 2, x1: b.x1 + 2, y0: y - 1, y1: y + laneH + 1 });
-    }
-    if (stale) {
-      tctx.fillStyle = '#ffb84f';
-      tctx.textAlign = 'right';
-      tctx.fillText('pointing changed since this scan — re-run', x1, tlH - 7);
-      tctx.textAlign = 'left';
-    }
-
-    // playhead: the clock. Outside the window it parks at the edge, pointing out.
-    var xp = X(nowMs), out = xp < x0 ? -1 : (xp > x1 ? 1 : 0);
-    xp = SAT.util.clamp(xp, x0, x1);
-    tctx.strokeStyle = out ? 'rgba(79,195,247,0.5)' : ACCENT;
-    tctx.fillStyle = tctx.strokeStyle;
-    tctx.lineWidth = 1.5;
+    // thumb
+    var col = stale ? '#ffb84f' : ACCENT;
+    var hot = !!tlDrag || tlHover;
     tctx.beginPath();
-    tctx.moveTo(xp, 9); tctx.lineTo(xp, tlH);
-    tctx.stroke();
-    tctx.beginPath();
-    if (out) {
-      tctx.moveTo(xp + out * 6, 6); tctx.lineTo(xp, 2); tctx.lineTo(xp, 10);
-    } else {
-      tctx.moveTo(xp - 4, 2); tctx.lineTo(xp + 4, 2); tctx.lineTo(xp, 9);
-    }
-    tctx.closePath();
+    tctx.arc(xp, yT, TL_THUMB_R + (hot ? 1 : 0), 0, Math.PI * 2);
+    tctx.fillStyle = out ? '#0c1116' : col;
     tctx.fill();
+    tctx.lineWidth = out ? 1.5 : 2;
+    tctx.strokeStyle = out ? col : (hot ? '#ffffff' : '#0c1116');
+    tctx.stroke();
+    if (out) {                                   // the clock is off this end
+      tctx.beginPath();
+      tctx.moveTo(xp - out * 2, yT - 3); tctx.lineTo(xp + out * 2, yT); tctx.lineTo(xp - out * 2, yT + 3);
+      tctx.stroke();
+    }
+
+    // while the thumb is held, its instant on a plate over the axis labels
+    if (tlDrag && !out) {
+      var txt = fmtClock(nowMs, spanS <= 600 ? 1 : 0);
+      var tw = tctx.measureText(txt).width + 10;
+      var bx = SAT.util.clamp(xp - tw / 2, 2, tlW - tw - 2);
+      tctx.fillStyle = '#0c1116';
+      tctx.fillRect(bx - 3, 0, tw + 6, TL_TICK_Y0 + 1);
+      tctx.fillStyle = 'rgba(79,195,247,0.16)';
+      tctx.strokeStyle = col;
+      tctx.lineWidth = 1;
+      tctx.fillRect(bx, 1, tw, 12);
+      tctx.strokeRect(bx + 0.5, 1.5, tw - 1, 11);
+      tctx.fillStyle = '#e8eef4';
+      tctx.fillText(txt, bx + tw / 2, TL_LABEL_Y);
+    }
+    tctx.textAlign = 'left';
   }
 
   // ---- render --------------------------------------------------------------
@@ -2017,7 +2003,7 @@
       centreMessage('Alt/Az pointing needs a site — set an active ground station in Locations');
       if (elHud) elHud.textContent = '—';
       if (elCursor) elCursor.textContent = '';
-      drawTimeline(list, nowMs);
+      drawTimeline(nowMs);
       return;
     }
     var ra0 = tp.raDeg, dec0 = tp.decDeg;
@@ -2040,7 +2026,7 @@
     drawCompass(t);
 
     // Status line (round 19 wording, kept): the pointing, the field, the
-    // orientation and the tracking mode. Stale-scan state lives on the timeline.
+    // orientation and the tracking mode, and (round 25) the stale-scan note.
     var fovTxt = o.fovShape === 'circ'
       ? 'r ' + SAT.util.fmtAngle(o.fovRDeg, 1)
       : SAT.util.fmtAngle(o.fovWDeg, 1) + ' × ' + SAT.util.fmtAngle(o.fovHDeg, 1);
@@ -2053,6 +2039,11 @@
     }
     hud += mount ? ' · sidereal off' : ' · sidereal on';
     if (elHud) elHud.textContent = hud;
+    if (elStale) {
+      var sc2 = SAT.state.scan;
+      var note = (sc2 && sc2.stale && sc2.params) ? 'pointing changed since this scan — re-run' : '';
+      if (elStale.textContent !== note) elStale.textContent = note;
+    }
     if (elZoom) elZoom.textContent = Math.round(view.zoom * 100) + '%';
     if (elMagAuto) {
       // "auto" says what it resolved to: the depth actually on screen
@@ -2062,7 +2053,7 @@
       if (elMagAuto.textContent !== lbl) elMagAuto.textContent = lbl;
     }
 
-    drawTimeline(list, nowMs);
+    drawTimeline(nowMs);
     if (mouse.inside && hover.id) showTip();
   }
 
@@ -2358,62 +2349,44 @@
 
   // ---- timeline input --------------------------------------------------------
 
-  function tlHitTest(x, y) {
-    for (var i = tlHits.length - 1; i >= 0; i--) {
-      var h = tlHits[i];
-      if (x >= h.x0 && x <= h.x1 && y >= h.y0 && y <= h.y1) return h;
-    }
-    return null;
-  }
-
   function tlScrub(x) {
     if (!tlRange || !SAT.clock || !SAT.clock.setDate) return;
     var f = SAT.util.clamp((x - tlRange.x0) / (tlRange.x1 - tlRange.x0), 0, 1);
     SAT.clock.setDate(new Date(Math.round(tlRange.t0 + f * (tlRange.t1 - tlRange.t0))));
+    requestRender();
   }
 
   function onTlMove(e) {
     if (!tlDrag) return;
-    var pt = evtPos(e, tcanvas);
-    if (Math.abs(pt.x - tlDrag.sx) > 3) tlDrag.moved = true;
-    if (tlDrag.moved || !tlDrag.hit) tlScrub(pt.x);
+    tlScrub(evtPos(e, tcanvas).x);
     e.preventDefault();
   }
 
   function onTlUp() {
     window.removeEventListener('mousemove', onTlMove);
     window.removeEventListener('mouseup', onTlUp);
-    var d = tlDrag;
     tlDrag = null;
-    if (d && d.hit && !d.moved) {
-      // a click on a bar: that object, at its closest approach
-      try { SAT.state.setSelection(d.hit.id); } catch (e) { /* ignore */ }
-      if (SAT.clock && SAT.clock.setDate && d.hit.cr.tCaMs != null) {
-        SAT.clock.setDate(new Date(d.hit.cr.tCaMs));
-      }
-    }
+    requestRender();
   }
 
+  /** The strip is one slider: a press anywhere takes the thumb there and a drag
+   *  carries it, on or off the strip, until release. */
   function wireTimeline() {
     tcanvas.addEventListener('mousedown', function (e) {
       if (e.button !== 0) return;
-      var pt = evtPos(e, tcanvas);
-      tlDrag = { sx: pt.x, hit: tlHitTest(pt.x, pt.y), moved: false };
-      if (!tlDrag.hit) tlScrub(pt.x);
+      tlDrag = { sx: evtPos(e, tcanvas).x };
+      tlScrub(tlDrag.sx);
       window.addEventListener('mousemove', onTlMove);
       window.addEventListener('mouseup', onTlUp);
       e.preventDefault();
     });
-    tcanvas.addEventListener('mousemove', function (e) {
-      if (tlDrag) return;
-      var pt = evtPos(e, tcanvas);
-      var h = tlHitTest(pt.x, pt.y);
-      tcanvas.style.cursor = h ? 'pointer' : 'ew-resize';
+    tcanvas.addEventListener('mousemove', function () {
       mouse.inside = false;
-      if ((h ? h.id : null) !== hover.id) { hover.id = h ? h.id : null; hover.t = null; requestRender(); }
+      if (hover.id) { hover.id = null; hover.t = null; }
+      if (!tlHover) { tlHover = true; requestRender(); }
     });
     tcanvas.addEventListener('mouseleave', function () {
-      if (hover.id) { hover.id = null; hover.t = null; requestRender(); }
+      if (tlHover) { tlHover = false; requestRender(); }
     });
   }
 
@@ -2461,7 +2434,7 @@
       '.chart-zoom{min-width:46px;font-family:' + MONO + ';}' +
       '.chart-view{flex:1 1 auto;position:relative;min-height:0;overflow:hidden;}' +
       '.chart-canvas{position:absolute;left:0;top:0;display:block;cursor:crosshair;outline:none;}' +
-      '.chart-time{flex:0 0 52px;position:relative;border-top:1px solid var(--border);' +
+      '.chart-time{flex:0 0 36px;position:relative;border-top:1px solid var(--border);' +
         'background:#0c1116;overflow:hidden;}' +
       '.chart-time canvas{position:absolute;left:0;top:0;display:block;cursor:ew-resize;}' +
       '.chart-status{flex:0 0 auto;display:flex;justify-content:space-between;gap:14px;' +
@@ -2470,6 +2443,8 @@
         'white-space:nowrap;overflow:hidden;}' +
       '.chart-status .chart-hud{color:var(--fg);overflow:hidden;text-overflow:ellipsis;}' +
       '.chart-status .chart-cur{flex:0 0 auto;}' +
+      '.chart-status .chart-stale{flex:0 1 auto;color:#ffb84f;overflow:hidden;text-overflow:ellipsis;}' +
+      '.chart-status .chart-stale:empty{display:none;}' +
       '.chart-pop{position:absolute;z-index:20;top:31px;left:6px;display:none;' +
         'background:var(--bg2);border:1px solid var(--border);border-radius:6px;' +
         'padding:7px 12px 7px 9px;box-shadow:0 10px 28px rgba(0,0,0,.55);font-size:12px;}' +
@@ -2647,13 +2622,14 @@
     elRuler = U.el('div', { class: 'chart-ruler' });
     elHud = U.el('div', { class: 'chart-hud' }, '');
     elCursor = U.el('div', { class: 'chart-cur' }, '—');
+    elStale = U.el('div', { class: 'chart-stale' }, '');
 
     var bar = buildToolbar();
     viewEl = U.el('div', { class: 'chart-view' }, [canvas, elTip, elRuler]);
     timeEl = U.el('div', { class: 'chart-time' }, [tcanvas]);
     var root = U.el('div', { class: 'chart-root' }, [
       bar, viewEl, timeEl,
-      U.el('div', { class: 'chart-status' }, [elCursor, elHud]),
+      U.el('div', { class: 'chart-status' }, [elCursor, elStale, elHud]),
       elPop,
     ]);
     body.appendChild(root);
@@ -2706,12 +2682,11 @@
     // Round 20: the marker-label format ('NAME [NORAD]', always decimal digits
     // — Alpha-5 is decoded server-side), pure and pinned by tools/test_chart.js.
     satLabel: satLabel,
-    // Round 22, pure and unit-tested: trail time ticks, the timeline's axis and
-    // lane packing, and the ruler's streak matching.
+    // Round 22, pure and unit-tested: trail time ticks, the timeline's axis, and
+    // the ruler's streak matching.
     tickStepS: tickStepS,
     tickLabel: tickLabel,
     timelineStepS: timelineStepS,
-    packLanes: packLanes,
     lineAngleDiff: lineAngleDiff,
     rankTrails: rankTrails,
     circTanDeg: circTanDeg,

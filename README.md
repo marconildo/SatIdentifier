@@ -93,7 +93,7 @@ In dev mode data lives in `./data/`.
 The chart is built to be held against an image. The window is four stacked
 parts — toolbar, chart, timeline, status line — and nothing overlaps the sky.
 
-![Sky Chart — a 1.5° × 1° field over 30 minutes: 28 crossings, names outside the frame, the selected trail ticked every 0.2 s, eclipsed trails dashed, the scan-window timeline underneath](docs/chart.png)
+![Sky Chart — a 1.5° × 1° field over 30 minutes: 28 crossings, names outside the frame, the selected trail ticked every 0.2 s, eclipsed trails dashed, the time slider over the scan window underneath](docs/chart.png)
 
 ![Sky Chart — a 15° × 10° field: about 1 800 stars to V 10.1, thirteen crossings](docs/chart-wide.png)
 
@@ -107,9 +107,8 @@ parts — toolbar, chart, timeline, status line — and nothing overlaps the sky
   exit times, the rate, the position angle and the trail's length.
 - **Dashed = in the Earth's shadow.** It crosses the field but reflects no
   sunlight: an optical streak is not that object.
-- **Timeline.** The strip under the chart is the scan window, one bar per
-  crossing from entry to exit. Drag to move the clock; click a bar to select
-  that object and jump to its closest approach.
+- **Time slider.** The strip under the chart is the scan window: a UTC axis
+  and a thumb for the clock. Press or drag anywhere on it to move the clock.
 - **Ruler (R).** Drag along a streak: its length and position angle, and the
   predicted trails ranked by how well they match it (offset and angle).
 - Wheel zooms about the cursor, drag pans, double-click re-aims, `F` fits,

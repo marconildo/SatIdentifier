@@ -1211,6 +1211,44 @@ for whoever measures this next: in headless Chrome a queued animation frame can
 sit unfired, which makes a synchronous-render timing loop read 0 ms — drain the
 queue first.
 
+### Round 25 (2026-11-15) — the timeline becomes a slider; rotation gets one
+
+Two adjustments from the user after a day with round 22's chart.
+
+**Sky Chart timeline: colour rows out.** Round 22 drew one bar per crossing in
+lanes under the axis, clickable. In use the rows were noise — the crossings are
+already on the chart and in the table — and the strip's real job was scrubbing
+time. It is now exactly that: a UTC axis, a track with the elapsed part filled,
+and a thumb. Press or drag anywhere; the drag follows the pointer off the strip;
+while held, the thumb's instant shows on a plate over the axis. 52 px → 36 px,
+which goes to the sky. `packLanes`, the bar hit-testing and click-a-bar-to-select
+are deleted, not hidden. The stale-scan sentence that lived in the strip's
+bottom corner moved to the status line (amber); the thumb turns amber too. The
+axis labels at the two ends of the window used to be dropped for lack of room —
+they are nudged inward instead, so the strip always says where it starts and
+stops.
+
+**Pointing: a rotation slider.** `Rot` was a number box. It now also has a
+0–360° slider, whole degrees, ticks every 90°, applied live so the chart turns
+under the drag. Details that took a second look:
+
+- *360 is 0.* State wraps the angle, so a thumb pushed to the right-hand end
+  would have been repainted at the left-hand end, under the user's pointer.
+  The repaint leaves a thumb at 360 alone when state says 0.
+- *Room.* First attempt put the slider on the Rot line as it stood: 98 px, 4°
+  a pixel. Second attempt gave it a line of its own: 338 px — and the panel
+  overflowed, because the user's saved window (420 × 408, packed between two
+  others) fits its rows exactly. Final: the slider stays on the Rot line and
+  the `encl` echo moves up to the FOV line (whose spacing tightens 2 px a gap so
+  the echo shows in full): 190 px, 2° a pixel, no height change.
+- *The last degree.* 2° a pixel cannot land on every degree, so the wheel over
+  the slider steps 1° a notch (Shift: 10°), and the arrow keys do the same; the
+  number box still takes fractions.
+
+Checked in headless Chrome with real mouse events: slider drag → 223°, chart
+and status line follow, scan marked stale; right-hand end → state 0, thumb at
+360; two wheel notches → +2°; timeline press-and-drag → clock, no selection.
+
 ## 13. Running the checks
 
 ```sh
@@ -1229,4 +1267,4 @@ python3 tools/test_server.py    # backend catalogue fetching (network stubbed)
 python3 tools/test_starcat.py   # catalogue builder: bright-star astrometry
 ```
 
-All green as of 2026-11-15 (round 24).
+All green as of 2026-11-15 (round 25).

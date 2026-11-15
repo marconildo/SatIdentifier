@@ -83,6 +83,14 @@ const SPAN_CHIPS = [['1m', 1], ['3m', 3], ['5m', 5], ['10m', 10], ['1h', 60]];
       '.pnt-msg.pnt-err{color:var(--danger);}',
       '.pnt-gap{height:1px;background:var(--border);margin:3px 0;flex:none;}',
       '.pnt-root input:disabled{opacity:.5;}',
+      // rotation slider: whatever the Rot line has left
+      '.pnt-slide{flex:1 1 auto;min-width:70px;height:16px;margin:0 2px;',
+      '  accent-color:var(--accent);cursor:pointer;}',
+      '#pnt-fov-echo{flex:0 1 auto;min-width:0;}',
+      // the FOV line now ends in the enclosing-radius echo: closer spacing lets
+      // it show in full at the minimum window width
+      '.pnt-root .row.pnt-tight{gap:4px;}',
+      '.pnt-tight .pnt-lbl{min-width:48px;}',
     ].join('\n');
     document.head.appendChild(st);
   }
@@ -126,6 +134,15 @@ const SPAN_CHIPS = [['1m', 1], ['3m', 3], ['5m', 5], ['10m', 10], ['1h', 60]];
 
   function setVal(input, v) {
     if (!input._pntEditing) input.value = v;
+  }
+
+  /** Put the rotation on its slider. 360° is stored as 0° (state wraps the
+   *  angle), so a thumb the user has just pushed to the right-hand end must stay
+   *  there rather than jump to the left-hand one under their pointer. */
+  function setSlide(slide, rotDeg) {
+    const v = String(Math.round(rotDeg));
+    if (v === '0' && slide.value === '360') return;
+    if (slide.value !== v) slide.value = v;
   }
 
   /** Sexagesimal sanity beyond what util.parseRA/parseDec enforce.
@@ -596,6 +613,36 @@ const SPAN_CHIPS = [['1m', 1], ['3m', 3], ['5m', 5], ['10m', 10], ['1h', 60]];
       setMsg('');
       refresh();
     });
+    // Round 25: the same angle on a slider, 0…360° in whole degrees — turning the
+    // field by hand against a frame is a drag, not a typing job. The number box
+    // stays for fractions. Both write obs.rotDeg; state wraps it to [0, 360).
+    const ROT_MARKS = [0, 90, 180, 270, 360];
+    const rotMarks = el('datalist', { id: 'pnt-rot-marks' },
+      ROT_MARKS.map(v => el('option', { value: String(v) })));
+    const rotSlide = el('input', {
+      type: 'range', class: 'pnt-slide', id: 'pnt-rot-slide',
+      min: '0', max: '360', step: '1', list: 'pnt-rot-marks',
+      title: 'detector rotation, 0–360° (position angle of the field’s up axis, ' +
+        'north through east) — drag, arrow keys or mouse wheel: 1° steps',
+    });
+    rotSlide.addEventListener('input', () => {
+      const v = Number(rotSlide.value);
+      if (!isFinite(v)) return;
+      SAT.state.setObs({ rotDeg: v });
+      setMsg('');
+      refresh();
+    });
+    // the wheel over the slider steps a whole degree per notch (Shift: 10°), for
+    // the last few degrees a drag is too coarse for
+    rotSlide.addEventListener('wheel', ev => {
+      if (!ev.deltaY) return;
+      ev.preventDefault();
+      const stepDeg = (ev.shiftKey ? 10 : 1) * (ev.deltaY < 0 ? 1 : -1);
+      const cur = Math.round(SAT.state.obs.rotDeg);
+      SAT.state.setObs({ rotDeg: ((cur + stepDeg) % 360 + 360) % 360 });
+      setMsg('');
+      refresh();
+    }, { passive: false });
     const flipIn = el('input', { type: 'checkbox', id: 'pnt-flip' });
     flipIn.addEventListener('change', () => {
       SAT.state.setObs({ flipEW: !!flipIn.checked });
@@ -658,11 +705,15 @@ const SPAN_CHIPS = [['1m', 1], ['3m', 3], ['5m', 5], ['10m', 10], ['1h', 60]];
       row([elLbl, elc.sexIn, elc.decIn, dsym(), elNote]),
       row([lbl('Preset')].concat(presetBtns.map(p => p.btn))),
       gap(),
-      row([lbl('FOV')].concat(shapeBtns.map(s => s.btn))
+      el('div', { class: 'row pnt-tight' }, [lbl('FOV')].concat(shapeBtns.map(s => s.btn))
         .concat([wIn, fovTimes, hIn, fovRLbl, rIn])
-        .concat(unitBtns.map(u => u.btn))),
-      row([lbl('Rot'), rotIn, el('span', { class: 'pnt-echo' }, '°'),
-        el('label', { class: 'chk' }, [flipIn, ' flip E/W']), fovEcho]),
+        .concat(unitBtns.map(u => u.btn)).concat([fovEcho])),
+      // Round 25: the slider takes everything the Rot line has left. The
+      // enclosing-radius echo moved up to the FOV line to make that ~190 px at
+      // the minimum window width; a second line was not an option — the panel
+      // is used at a height that exactly fits its rows.
+      row([lbl('Rot'), rotIn, el('span', { class: 'pnt-echo' }, '°'), rotSlide, rotMarks,
+        el('label', { class: 'chk' }, [flipIn, ' flip E/W'])]),
       row([lbl('Camera'), camSel, camName, camSave, camDel]),
       msg,
     ]));
@@ -673,7 +724,7 @@ const SPAN_CHIPS = [['1m', 1], ['3m', 3], ['5m', 5], ['10m', 10], ['1h', 60]];
       modeBtns, trackBtns, azLbl, elLbl,
       ra, dec, az, elc, elNote, presetBtns,
       shapeBtns, unitBtns, wIn, hIn, rIn, fovTimes, fovRLbl, fovEcho,
-      rotIn, flipIn,
+      rotIn, rotSlide, flipIn,
       camSel, camName, camSave, camDel,
       msg,
     };
@@ -792,8 +843,11 @@ const SPAN_CHIPS = [['1m', 1], ['3m', 3], ['5m', 5], ['10m', 10], ['1h', 60]];
     ui.hIn.style.display = rect ? '' : 'none';
     ui.fovRLbl.style.display = rect ? 'none' : '';
     ui.rIn.style.display = rect ? 'none' : '';
-    ui.fovEcho.textContent = '· encl ' + U.fmtAngle(SAT.state.fovRadiusDeg(), 2);
+    ui.fovEcho.textContent = 'encl ' + U.fmtAngle(SAT.state.fovRadiusDeg(), 2);
+    ui.fovEcho.title = 'radius of the circle that encloses the field: ' +
+      U.fmtAngle(SAT.state.fovRadiusDeg(), 2);
     setVal(ui.rotIn, trim(o.rotDeg, 3));
+    setSlide(ui.rotSlide, o.rotDeg);
     ui.flipIn.checked = !!o.flipEW;
 
   }

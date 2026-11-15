@@ -1162,7 +1162,9 @@ and its layout follows from that:
   - **Status line (round 19 wording, round 22 position).** `RA … Dec … · W° × H°
     (ONE decimal) · rot N° [· mirrored] [Az/El when altaz] · sidereal on|off`,
     now in the status line under the chart instead of over it. The zoom factor
-    is on its toolbar button. Stale-scan state is shown on the timeline.
+    is on its toolbar button. A stale scan adds an amber `pointing changed
+    since this scan — re-run` between the cursor readout and this text
+    (`.chart-stale`; round 25 — it was drawn on the timeline in rounds 22–24).
   - **the FOV outline**: accent rectangle with corner brackets (or circle), a
     centre cross at the pointing, the field's angular size as one label under
     the bottom-right corner; the region outside is dimmed ~46% so the frame
@@ -1216,15 +1218,18 @@ and its layout follows from that:
     alpha, no arrowheads, no context tracks except the picked object's, at most
     30 names. A 30° field over an hour is 1 600 trails; at full weight that is a
     solid block of colour and 112 ms a frame (measured), thinned it is 23 ms.
-  - **Timeline** (`settings.chart.timeline`): a strip under the chart spanning
-    the scan window `[t0, t0 + spanMin]`, with a UTC axis (`timelineStepS`), one
-    bar per charted crossing from entry to exit in its type colour (lanes packed
-    by `packLanes`), and the clock as a playhead (parked at the edge, pointing
-    out, when the clock is outside the window). **Press or drag** moves the
-    clock (`SAT.clock.setDate`); **click a bar** selects that object and jumps
-    to its closest approach; hovering a bar picks the trail on the chart. A
-    stale scan dims the bars and says so. WHEN is half of an identification and
-    the chart alone only shows where.
+  - **Timeline** (`settings.chart.timeline`): a 36 px strip under the chart
+    spanning the scan window `[t0, t0 + spanMin]` — **a time slider and nothing
+    else** (round 25, user request: the per-crossing colour bars of round 22
+    are removed, with `packLanes`). It draws a UTC axis (`timelineStepS`; the
+    labels at the two ends of the window are nudged inward, not dropped), a
+    track whose elapsed part is filled, and the clock as the thumb (hollow and
+    parked at that end, with a chevron, when the clock is outside the window).
+    **Press or drag anywhere on the strip** moves the clock
+    (`SAT.clock.setDate`); the drag follows the pointer off the strip until
+    release, and while it is held the thumb's instant is shown on a plate over
+    the axis. The strip never selects an object. On a stale scan the thumb and
+    fill turn amber; the words are on the status line.
   - **Ruler** (toolbar, or `R`): drag along a streak. The two ends are stored
     as SKY positions (so the line stays on its stars under zoom, pan and a
     running clock); the panel shows length, position angle both ways (a streak
@@ -1253,7 +1258,7 @@ and its layout follows from that:
   changes by more than 10% of the field. A trail is two strokes (swept, to come),
   not one per segment.
 - Expose: `SAT.chart = { init, requestRender, fitView, autoMagLimit, starDot,
-  satLabel, tickStepS, tickLabel, timelineStepS, packLanes, lineAngleDiff,
+  satLabel, tickStepS, tickLabel, timelineStepS, lineAngleDiff,
   rankTrails, circTanDeg, applyStarBudget }` (all but the first three pure, unit-tested in
   tools/test_chart.js, which also drives the real mouse and key handlers and
   asserts that no two pieces of chart text overlap).
@@ -1321,6 +1326,15 @@ no section headers taking their own line, no wrapped rows.
   laid out as a tight grid, not a tall stack. **No built-in presets** (round-2
   review): they were one person's guesses about other people's equipment; the
   dropdown holds only what the user saves.
+- **Rotation line (round 25):** `Rot [number box] ° [slider] ☐ flip E/W`. The
+  slider (`#pnt-rot-slide`, `type=range`, 0…360, step 1°, tick marks every 90°)
+  and the number box (−360…360, fractions allowed) both write `obs.rotDeg`,
+  which state wraps to [0, 360); each repaints the other. `input` events apply
+  live, so the chart turns under the drag. The right-hand end is 360° ≡ 0°: the
+  thumb stays where it was pushed while the box reads 0. The mouse wheel over
+  the slider steps 1° per notch (Shift: 10°), wrapping. To give the slider the
+  line, the enclosing-radius echo (`encl …`) moved to the end of the FOV line —
+  NOT a second line: the panel is used at a height that exactly fits its rows.
 - There is deliberately NO exposure length and NO plate scale (round-1 review):
   the scan timespan is the only time quantity, and the trail across the field is
   the identification tool.
