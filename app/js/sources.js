@@ -1,7 +1,7 @@
 /* SAT.ui.sources — where the object set comes from.
  *
  * The catalogue is a MERGED set from four sources — Space-Track (full GP
- * catalogue plus one-off queries), CelesTrak (full bulk catalogue plus
+ * catalogue plus one-off queries), CelesTrak (full catalogue plus
  * single-object queries), McCants classified files, and pasted TLEs —
  * deduplicated by NORAD with the newest elements winning. Every action here
  * goes through state.addTles(tag, payload, {replace}), which also rebuilds
@@ -208,7 +208,7 @@
     // including the debris and rocket bodies unexpected trails usually turn out to
     // be. Buttons, not menu entries inside tabs, for that reason. Round 21: TWO
     // providers, each named on its button with a source note beneath — CelesTrak
-    // (bulk file, no account) above Space-Track (the complete set, account
+    // (launch-decade GP queries, no account — round 22) above Space-Track (the complete set, account
     // required) — after the SATCAT metadata button was mistaken for a CelesTrak
     // catalogue loader. Each replaces only its OWN source tag, so the freshness
     // block's provenance stays truthful whichever is pressed; selected-object
@@ -217,8 +217,8 @@
     const ctGo = async (refresh) => {
       if (ctBtn.disabled) return;
       busy(ctBtn, ctStatus, refresh
-        ? 'Re-fetching the CelesTrak full catalogue…'
-        : 'Fetching the CelesTrak full catalogue…');
+        ? 'Re-fetching the CelesTrak full catalogue (nine queries, ~30 s)…'
+        : 'Fetching the CelesTrak full catalogue (nine queries, ~30 s)…');
       ctRefresh.disabled = true;
       try {
         const d = await api('/api/celestrak/full' + (refresh ? '?refresh=1' : ''));
@@ -234,7 +234,8 @@
       onclick: () => ctGo(false),
     }, 'Load full catalogue (CelesTrak)');
     const ctRefresh = U.el('button', {
-      class: 'btn', title: 'Bypass the 6 h disk cache and re-fetch from CelesTrak',
+      class: 'btn', title: 'Re-fetch from CelesTrak. Its data updates every 2 h — ' +
+        'sooner than that the saved copy is served, because a repeat is refused',
       onclick: () => ctGo(true),
     }, '⟳ Force refresh');
 

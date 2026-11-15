@@ -267,7 +267,11 @@
   // about local files only. Scheme (CONTRACT "Deep tile set"): 4° dec bands
   // 0..44, single polar tiles at |dec| >= 86, twelve 30° RA columns elsewhere.
   const TILE_BAND = 4, TILE_COLS = 12, TILE_COL_DEG = 30;
-  const TILE_LRU = 16;              // tiles kept in memory (~1 MB each)
+  // Tiles kept in memory. A V 13 tile averages 105 kB (54 MB over 518 tiles; the
+  // "~1 MB" of the m17 era is long gone). Round 24 lets views up to 26 deg use
+  // the tiles: a 16 deg cone at high declination wraps every RA column of eight
+  // or nine dec bands, ~100 tiles, ~11 MB.
+  const TILE_LRU = 128;
   let deepIdx = null;               // null = not probed; {present:false} | index
   let deepProbing = false;
   let deepBroken = false;           // tile 404/parse failure: treat as not built

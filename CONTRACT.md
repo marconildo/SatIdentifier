@@ -108,6 +108,30 @@ step, a committed binary artifact, and `-fno-strict-aliasing` care around
 or the catalogue grows past ~100 k objects. The structural optimisations below are
 worth far more than the language, and they are what the budget above already assumes.
 
+**Round 22 — new numbers, as that rule asks.** By 2026-11 the catalogue was
+32 912 objects and long scans had drifted past the table above: measured single
+thread, the round-21 engine took 7.7 s for 6 h and **31–34 s for 24 h**, 80–90% of
+it stage 2 propagating every survivor at every step. The answer was again
+structural, not the language: stage 2 now **skips** every stretch in which an
+object provably cannot reach the field (see "Algorithm"), and stage 3 walks the
+field boundary instead of sampling a grid. Same machine, same catalogue, single
+thread, thirteen scenarios (`scratchpad/bench.js`):
+
+| Scan | round 21 | round 22 | propagations |
+|---|---|---|---|
+| 1.5°×1° frame, 30 min | 0.13 s | 0.05 s | 0.10 M → 0.01 M |
+| 15°×10° frame, 1 h | 1.1 s | 0.11 s | 1.41 M → 0.10 M |
+| 2°×1.5°, 6 h | 7.7 s | 0.33 s | 12.0 M → 0.55 M |
+| 5° parked mount, 6 h | 11.0 s | 0.48 s | 16.4 M → 0.78 M |
+| GEO belt 3°×2°, 24 h @ 60 s | 30.8 s | 2.6 s | 45.3 M → 4.5 M |
+| GEO stare 2°, 24 h @ 60 s | 34.5 s | 2.0 s | 44.6 M → 3.7 M |
+| LVLH 10°×10° from orbit, 90 min | 9.7 s | 0.45 s | 17.2 M → 0.68 M |
+| all thirteen | **106 s** | **7.2 s** | |
+
+3–10% of the fixed grid is actually propagated. `scan.js`'s estimate charges 10%
+(`SKIP_FRACTION`), so the 60 M refusal limit now corresponds to ten times the
+span it used to.
+
 ### Structural rules for the hot loop (from Bill Gray's `sat_id`)
 
 These are the difference between the table above and something 50× slower:
@@ -145,11 +169,22 @@ to arcminute precision against a star field**, so the following are mandatory:
   compare against a star field they need geometric. Convert explicitly.
 - **Topocentric parallax** is handled implicitly (we always difference against the
   observer's geocentric position vector) — never use geocentric satellite RA/Dec.
-- **Light-time** (≤ 0.13 s, ≤ 0.005″ of motion) and **diurnal aberration** (≤ 0.3″)
-  are negligible against TLE error (~1 km ⇒ several arcminutes) and are NOT applied.
-  **Annual aberration** (≤ 20.5″) is likewise not applied to satellites, and star
-  positions are left at catalogue J2000 mean places, so chart and satellites stay
-  mutually consistent. Document this in the Help window; do not "fix" one side alone.
+- **Light time IS applied (round 22); aberration is not.** Every reported and
+  drawn direction is the **astrometric place**: the observer at the instant of
+  reception, the satellite where it was `ρ/c` earlier — to first order
+  `r − v·ρ/c`, which is exact to a micrometre at these speeds. The displacement is
+  `v⊥/c`: **5″ for LEO whatever the range, 2″ for GEO** (the round-1 note here
+  said "≤ 0.005″ of motion", which was the Earth's rotation during the light
+  time, not the satellite's own travel — the satellite moves 7.7 km/s, not
+  0.46). It costs nothing and it is a systematic along-track bias.
+  **Aberration** — annual (≤ 20.5″), diurnal (≤ 0.3″), and an orbit site's own
+  (≤ 5″) — is applied to neither satellites nor stars: it displaces a satellite
+  and the stars around it alike, star positions are left at catalogue J2000 mean
+  places, and so chart and satellites stay mutually consistent. Astrometric place
+  is also exactly what a plate solution against catalogue stars returns for a
+  measured streak. Say so in the Help window; do not "fix" aberration on one
+  side alone. `SAT.prop.look(…, {lightTime:false})` gives the geometric
+  direction, for tests against satellite.js's own look angles only.
 
 ### Precession — the specific ways this goes wrong
 
@@ -197,7 +232,8 @@ Bill Gray rewrote his own precession code twice; the reasons are documented in
 | Annual aberration | ≤ 20.5″ | no (consistently, both sides) |
 | Precession + nutation, done properly | < 1″ | **yes** |
 | Equatorial vs ecliptic precession form | ~2 mas | irrelevant |
-| Light-time, diurnal aberration | < 0.3″ | no |
+| Light time (satellite's travel during ρ/c) | 5″ LEO, 2″ GEO | **yes** (round 22) |
+| Diurnal aberration | < 0.3″ | no (consistently, both sides) |
 
 So: **`frames.js` must not be the dominant error, and it easily is not.** The claim
 to make in the UI is "arcsecond-level frame handling; arcminute-level truth, limited
@@ -496,49 +532,142 @@ Typical survival on a 27 k catalogue is 10–40% depending on pointing; a pointi
 the pole kills the entire GEO belt outright. Report the counts (see below) — a cull
 this aggressive must be visible, or a bug in it looks like "no satellites tonight".
 
-**Stage 2 — coarse time sweep, in TEME.** Survivors are sharded across workers. Per
-epoch, **once**, each worker computes GMST, the site's TEME vector, and the pointing's
-TEME unit vector (J2000 → TEME via `frames`, i.e. the *pointing* is rotated, never the
-catalogue). Then per satellite: `sgp4(satrec, tsince)`, topocentric vector by
-subtraction, horizon test `dot(topo, site) > 0`, and separation as a **dot product
-against `cos(margin)`** — no `acos`, no `atan2` anywhere in this loop.
+**Stage 2 — coarse sweep with skipping, in TEME (round 22).** Per epoch, **once**,
+the worker tabulates the observer state and the pointing's TEME unit vector
+(J2000 → TEME via `frames`, i.e. the *pointing* is rotated, never the catalogue).
+Then, **object by object**, it asks one question at each step it visits:
 
-The margin is adaptive, recomputed per step from that step's own range and speed:
+> The satellite is at range ρ and **D km from the sightline ray**. How long before
+> it could possibly be in the field?
+
+In the field means within angle R of the boresight, i.e. within `ρ·sin R` km of
+the ray, so the gap to close is `C = D − ρ sin R`. It closes no faster than
+things move: the satellite at most its osculating perigee speed `V_sat`; the
+ray's origin at most the observer's speed `V_s`; the ray's direction turning at
+most `Ω_p`, which sweeps the ray's nearest point at `Ω_p × (its range)`, and
+that range is at most `ρ + V_r t` with `V_r = V_sat + V_s`. `ρ sin R` itself
+grows no faster than `V_r sin R`. In-field is therefore impossible while
 
 ```
-margin = fovRadiusDeg + omegaDeg * coarseStepS + tleSlopDeg,  omega = |v_topo| / rangeKm
+C  >  [V_r (1 + sin R) + Ω_p ρ] · t  +  (Ω_p V_r / 2) · t²
 ```
 
-so a GEO object gets arcminutes while an overhead LEO object gets tens of degrees.
-`tleSlopDeg` is a **per-object tolerance from TLE age** — Bill Gray's `# Max error`
-idea: elements a month old on a decaying LEO object need a much wider box than
-fresh ones. Grow it roughly linearly with `now − epoch`, and surface it in the UI so
-a match found only inside the slop is not presented as a confident identification.
+and the positive root of that quadratic is `clearTime()`. It holds backwards in
+time as well. `V_s` and `Ω_p` are **measured off the per-step tables**, so a
+ground site, an orbit site, a sidereal field and an LVLH-fixed one are all the
+same code; nothing in the bound knows what kind of orbit or observer it serves.
+The step rule is then two lines:
 
-A step whose separation is under the margin opens (or extends) a *candidate window*
-`[t − coarseStep, t + coarseStep]`. Where consecutive coarse positions straddle the
-field, prefer the **great-circle arc** between them to a point test with a padded
-radius: it is a cheaper-to-satisfy and tighter criterion, and it permits a larger
-`coarseStepS` for the same recall.
+- `clearTime ≥ one step` → jump `floor(clearTime / step)` whole steps (capped at
+  2 h). Nothing can have been missed: the bound covers all of them, and the step
+  just behind.
+- `clearTime < one step` → the object may be in the field within one step either
+  side: open (or extend) the candidate window `[t − step, t + step]`.
 
-**Stage 3 — fine refinement.** Each candidate window is re-stepped at `fineStepS`
-(default 1 s). Separation vs. the FOV boundary (rectangular in the rotated chart frame,
-or circular) gives the in-field samples; `tEnterMs`/`tExitMs` are bisected to 50 ms
-against that boundary, `tCaMs` by parabolic fit on the separation minimum. Photometry,
-rate, PA and up to 64 `path` samples are computed here. Objects that never actually
-enter the field are dropped.
+A LEO object on the far side of the Earth is ~13 000 km from the sightline and
+closes at ≤ ~8.5 km/s, so it is not looked at again for 25 minutes; a typical
+orbit costs a dozen propagations instead of 190. There is **no horizon test and
+no angular margin in stage 2**: an object below the horizon is simply far from a
+sightline that points above it, and visibility is imposed exactly, per sample,
+in stage 3. The rounds 1–21 devices this replaces — the `ω·Δt` margin from the
+instantaneous rate, the great-circle chord rescue, the per-object TLE slop
+widening the margin — were heuristics that produced candidates, never results
+(stage 3 dropped whatever was not actually in the field); the bound is rigorous
+and produces fewer. Pads: `R` is widened by 0.02° and `C` reduced by
+`1 km + 4·10⁻⁵ ρ` (the light-time displacement stage 3 applies and stage 2 does
+not); `V_sat` carries 3% + 50 m/s over the osculating perigee speed, a
+twenty-fold allowance on J2's ~0.15%. `tleSlopDeg` is still **reported** per
+crossing (`(1 km + 2.5 km/day·age)/ρ`, capped) so the UI never presents an old
+element set as a confident identification — it no longer changes what is found.
+The grid is uniform (`ceil(span/step) + 1` steps): the satellite, the observer
+and the pointing are evaluated at the same instant on every step, the last
+included.
+
+**Stage 3 — refinement by walking the boundary (round 22).** There is **no
+sampling grid**. Each candidate window is walked: `probe(t)`, step by however
+long the probe says the membership cannot change, probe again. A probe is one
+SGP4 call plus dot products — the detector frame is three vectors (boresight,
++X, +Y), so membership is `X = (w·ex)/(w·b)`, `Y = (w·ey)/(w·b)` with no RA/Dec
+and no trigonometry — and it returns:
+
+- `in` — inside the true boundary (rectangle in the rotated detector frame, or
+  circle) **and visible**: above the horizon / `minElDeg` on the ground, clear
+  of the Earth's limb in orbit;
+- `sep` — angle from the boresight;
+- `h` — a safe step: while well outside, the rigorous `clearTime()`; near or
+  inside the field, `0.5 × (distance to the edge) / (speed toward it)` on the
+  tangent plane, capped at the time in which the viewing geometry could change
+  by a quarter (`0.25 / (|v_rel|/ρ + n_LEO)`) — the edge can then only be
+  overshot if the speed more than doubles within one step — and clamped to
+  [10 ms, 10 min].
+
+Where two consecutive probes disagree, the boundary between them is bisected to
+**10 ms** against the same predicate, so entry/exit and membership can never
+disagree. Closest approach is a golden-section minimum of `sep` (5 ms), bracketed
+by the samples either side of the smallest. The reported row then goes through
+the **exact** frame functions (`solveAt`: full nutation series, light time);
+only the search samples use the 10-minute-bucketed TEME↔J2000 rotation
+(< 0.001″). Photometry geometry, both rates, PAs and up to 64 `path` samples
+(spacing `fineStepS`) are computed here. Objects that never actually enter the
+field are dropped.
+
+**Why the grid had to go.** Rounds 1–21 sampled each window at `fineStepS` and
+kept the samples that landed inside. At the default 1 s that *missed any crossing
+shorter than a second* whenever no sample fell in it: measured on the 2026-11-15
+catalogue, **9 of the 14 objects that crossed a 0.2° field in two hours, 12 of 32
+for 0.5°, 3 of 29 for 1°** — every one a fast LEO pass, i.e. exactly the trail
+someone opens this tool to identify. `fineStepS` now only spaces the drawn path
+samples. The limitation that remains is the mirror image and far smaller: a
+grazing excursion out of the field and back *between two probes* of a slow
+object (≤ 10 min apart, and only when its measured speed toward the edge is
+near zero) is merged into one crossing.
+
+**The detector is carried rigidly with the mount.** For `track:'sky'` the three
+frame vectors are constant in J2000. For `track:'mount'` they are constant in
+the Earth-fixed frame (ground) or in LVLH (orbit), with `rotDeg` read **at the
+scan start**. On the ground that is what rounds 1–21 did in effect — a fixed
+alt/az has a fixed parallactic angle. In LVLH it is a correction: the sky turns
+under a body-fixed sensor once per orbit, and a rectangle held at a constant
+angle to celestial north was not the rectangle that sensor sweeps. The chart
+uses the same reference instant (`scanRefMs`), so the two agree.
+
+**A ground target is in the field only while above the horizon** (the geocentric
+"up", as stage 2 always used). Rounds 1–21 dropped below-horizon *coarse samples*
+but tested no horizon in stage 3, so a field hanging partly below the horizon
+reported the below-horizon stretch whenever a neighbouring sample was above.
+
+**Co-located objects.** The observer's time-since-epoch is formed exactly as
+every target's (`tsince0 + (t − t0)/60000`), never from a fresh Julian date
+(which resolves only ~40 µs) or a `Date` (which drops fractional milliseconds).
+At 7.7 km/s those are 0.3 m and 7.7 m of observer jitter — and for the objects
+that fly *with* an orbital observer (the other ISS modules carry the station's
+own elements) that jitter was the entire topocentric vector: a direction made of
+rounding noise, flickering through the field thousands of times a scan. Formed
+identically, a co-located object has range exactly zero and is never in the
+field.
 
 Rejected-at-each-stage counts are reported in `'scan-done'` and shown in the UI —
-a scan that culls 90% of the catalogue should say so, not look like it found nothing.
+a scan that culls 90% of the catalogue should say so, not look like it found
+nothing. `'scan-done'` also carries `propagations`, `gridPropagations` (what a
+fixed-step sweep of the same survivors would have cost) and per-stage `timing`.
 
-**Budget.** Stage 2 dominates. Measured at 0.61 µs per propagation (see Performance
-decisions), 27 k objects × 40% survival × 120 coarse steps ≈ 1.3 M propagations ≈
-0.8 s single-threaded, ~0.15 s across 6 workers. If the estimate exceeds ~60 M
-propagations, `run()` refuses and reports the estimate plus the two knobs that fix it
-(`coarseStepS`, `spanMin`) rather than freezing the tab.
+**Budget.** See "Performance decisions" for round-22 numbers. If the estimate
+(`objects × steps × SKIP_FRACTION`) exceeds ~60 M propagations, `run()` refuses
+and reports the estimate plus the two knobs that fix it (`coarseStepS`,
+`spanMin`) rather than freezing the tab.
 
 `maxCrossings` truncates the result set; `'scan-done'` carries `truncated:true` so the
 UI can say so explicitly. Never silently drop.
+
+**Verification (`tools/test_scan.js`, all with no network).** [b] cull on/off
+identity; **[r] recall against an exhaustive brute force** that shares nothing
+with the engine — every object, every second, a plain TEME gate no orbit can
+beat, then 5 ms sampling through `frames.js` with iterated light time: every
+crossing found, entry and exit within 25 ms, nothing spurious; **[k] the
+clear-time bound walked instant by instant** for sidereal, parked and LVLH
+pointings (12 000 bounds, ~900 000 instants, zero violations); [h] nothing
+reported from below the horizon; [a]/[o] reported RA/Dec against an independent
+astrometric recompute.
 
 ### Worker protocol (`js/worker/scan-worker.js`)
 
@@ -554,7 +683,8 @@ in behaviour to `frames.js` — `frames.js` is the reference implementation).
   *before* posting, because the worker owns satrecs for its shard only and the
   observer must exist in every worker.
 - worker → main `{type:'progress', done, total}`
-- worker → main `{type:'result', crossings:[...], culled:{stage1, stage2}}`
+- worker → main `{type:'result', crossings:[...], culled:{stage1, stage2, stage3, …},
+  propagations, gridPropagations, timing:{stage1Ms, stage2Ms, stage3Ms}}`
 - main → worker `{cmd:'cancel'}`
 
 ## Orbital observing stations (v0.2) — the moving-observer amendment
@@ -608,8 +738,11 @@ ground-site rule; the converters gate it on kind, not the callers.
    hard Earth sphere: with `t* = −s·ρ̂`, occluded when `0 < t* < ρ` and
    `|s + t*ρ̂| < Re`. Hard `Re`, no atmosphere pad — inclusion-conservative: a
    limb-grazing LOS is kept and the observer merely sees it against bright air.
-   The limb test is part of `insideField`, so entry/exit bisection resolves a target
-   *rising from behind the Earth* the same way it resolves a field edge.
+   The limb test is part of field membership (`probe().in`), so entry/exit
+   bisection resolves a target *rising from behind the Earth* the same way it
+   resolves a field edge. On the **ground** the same slot is filled by the
+   horizon: a target is in the field only while its geocentric elevation is
+   ≥ max(0, `minElDeg`) (round 22).
 2. **Sky/mount rates.** The sky rate is inertial and unchanged. The mount rate
    subtracts the observer frame's rotation: `ω⊕ ẑ × ρ` on the ground,
    `Ω_LVLH × ρ` with `Ω_LVLH = (r×v)/|r|²` in orbit.
@@ -645,24 +778,31 @@ real objects — the one failure a cull must never have. On an orbit site:
 
 ### Stage 2/3 under a moving observer
 
-Adaptive margin `ω·Δt` with `ω = |v_target − v_obs|/ρ` was already
-observer-general. Close conjunctions self-protect: `ω·Δt ≥ π` forces the step to
-hit, so a target passing within `v_rel·Δt/π` (~100 km at 30 s steps) can never slip
-between samples. The great-circle chord rescue keeps its justification — over one
-coarse step the *relative* motion is near-rectilinear, and a straight relative
-track sweeps a great circle for any observer. The residual is relative-acceleration
-curvature, so **orbit sites clamp `coarseStepS` to ≤ 10 s** (curvature scales with
-Δt², so 30 s → 10 s buys 9×) — the estimate/refusal maths must use the clamped
-value, not the setting. TLE slop doubles up: `(slopKm_target + slopKm_obs)/ρ`,
-because the observer's ephemeris error is indistinguishable from the target's at
-the sensor.
+Round 22 made stages 2 and 3 observer-general by construction: the clear-time
+bound takes the observer's top speed `V_s` and the boresight's top turn rate
+`Ω_p` from the per-step tables, whatever produced them, and the detector frame is
+three vectors carried in LVLH. Nothing in either stage asks what kind of observer
+it serves. What remains orbit-specific:
+
+- **`coarseStepS` is still clamped to ≤ 10 s** on orbit sites. The bound no
+  longer needs it for soundness (the chord rescue it protected is gone); it
+  stays because the tables sample the observer's own motion, and because a
+  finer step makes tighter candidate windows — with skipping, it costs table
+  entries, not propagations. The estimate/refusal maths use the clamped value.
+- **The detector is LVLH-fixed** (see "Algorithm"): `rotDeg` is read at the scan
+  start and the rectangle turns with the sensor.
+- **Co-located objects** (other modules of the observing station) have range
+  exactly zero and are never in the field — see "Co-located objects".
+- TLE slop is reported as before; the observer's own slop is no longer added to
+  a margin, because there is no margin.
 
 ### Documented omissions (measured against the TLE-slop floor, ~arcmin at best)
 
-Light time (≤ ~5″ at 1 000 km for LEO-on-LEO) and the observer's orbital aberration
-(v/c ≈ 25 µrad ≈ 5″) are ignored, as annual aberration already is for ground sites.
-Both are two orders under the slop the UI already discloses. Do not "fix" one
-without the other and without a use case that resolves 5″.
+**Light time is applied** (round 22 — see "Why `SAT.frames` exists"): positions
+are astrometric, on orbit sites as on the ground. The observer's **orbital
+aberration** (v/c ≈ 25 µrad ≈ 5″) is ignored, as annual aberration is for ground
+sites, and for the same reason: it displaces the target and the stars around it
+alike. Do not apply it to one side.
 
 ### UI consequences
 
@@ -747,6 +887,26 @@ falls back to the Tycho file, then to the bright catalogue. The PM propagation i
 not cosmetic: the Tycho build's J2000 mean places put 169 stars more than 13″ off
 at the 2026 epoch, the worst by ~227″ (61 Cyg class) — visibly wrong on the chart.
 
+**Bright-star astrometry (round 23) — binding for every build.** Gaia DR3 does
+not contain its brightest stars (everything brighter than G ≈ 3 saturates and is
+absent), so `merge_bright()` adds them whole from `starcat.js` — whose positions
+are **J2000 places rounded to 0.01°, no proper motion**: fine for photometry and
+an all-sky chart, wrong for this one. Measured in the shipped catalogue against
+SIMBAD places at its own epoch: **Arcturus 63″ off, Procyon 36″, Sirius 31″,
+Vega 28″, Capella 20″, Rigel 17″**, while every Gaia star around them was good
+to 0.5″. `refine_bright()` recognises those stars (both coordinates on the 0.01°
+lattice, V ≤ 4.6) and replaces each position with its **Hipparcos** place
+(new reduction, VizieR `I/311/hip2`, complete to V ≈ 7.3) carried linearly to
+the catalogue's epoch; magnitudes are untouched and the arrays are re-sorted by
+declination. It runs inside every build (`finish()`, `build_deep_tiles()`), and
+`make_starcat.py --refine-bright` repairs catalogues already on disk in place
+(idempotent; one ~200 kB download, with a VizieR mirror list — the CDS host was
+answering 404 on 2026-11-15). Applied 2026-11-15: 70 stars in `stars_deep.bin`,
+105 in 86 deep tiles; the fourteen-star truth table now agrees to **≤ 0.2″**
+(`tools/test_stars.js` [5b], `tools/test_starcat.py`). `starcat.js` itself is
+unchanged — names and constellation figures are drawn from it on fields wider
+than 5°, where 18″ is under a pixel.
+
 Binary format — little-endian, **structure of arrays** so the frontend builds
 `Float32Array`/`Int16Array` views directly over the buffer with no per-star parsing.
 An interleaved 10-byte record would be misaligned and force a slow `DataView`.
@@ -797,11 +957,12 @@ with the right magnitude. It caught every one of the above. Keep it.
 - `SAT.stars.deepField(ra0, dec0, radiusDeg, magLimit, onReady)
   -> {state:'ready'|'loading'|'error', stars, truncated, magLimit?}` (rounds
   15-16 — LOCAL deep tiles; the round-14 online VizieR cone is REMOVED, no
-  runtime network fetch) — the deep star source behind the chart's < 3° fields,
+  runtime network fetch) — the deep star source behind the chart's views
+  narrower than 26° (3° until round 24),
   reading the tiled local catalogue that `make_starcat.py --deep-tiles` builds
   (see below) through `GET /api/stars/deep` (presence probe, once) and
-  `GET /api/stars/tile/<name>` (one small binary per tile, LRU-cached ~16 tiles
-  in memory). Never throws, never rejects. When every tile covering the cone is
+  `GET /api/stars/tile/<name>` (one small binary per tile, ~105 kB; up to 128
+  LRU-cached in memory since round 24). Never throws, never rejects. When every tile covering the cone is
   cached the result is computed synchronously — per-tile cone queries (the same
   kernel `cone()` uses) merged and capped at the brightest 20000 — and the
   state is `'ready'` with `magLimit` reporting the tile set's actual V cut (the
@@ -859,46 +1020,85 @@ Each is registered from main.js via
 Gnomonic (TAN) sky chart on `<canvas>`, tangent at the pointing. This is the primary
 view and gets the largest default window.
 
+**Round 22 redesign — binding.** The panel exists to be *held against a frame*,
+and its layout follows from that:
+
+- **Four stacked parts, nothing overlapping the sky**: a toolbar of labelled
+  controls, the chart canvas, a **timeline** strip, a status line. (Rounds 1–21
+  floated a toolbar of two-letter buttons and a HUD over the chart.)
+  - Toolbar: **Layers ▾** (a menu listing every layer by its full name, with
+    checkboxes: satellite names, satellite tracks, time ticks, colour key /
+    stars, star names, constellation lines, constellation names, Sun and Moon,
+    RA/Dec grid / timeline), **Stars** depth select (`auto`, V 4.5 … 13 — the
+    same exactly-deliverable steps as round 17), **Ruler**, **− zoom% + Fit**,
+    **Mirror E/W**. Every control has a `title`.
+  - Status line: cursor RA/Dec (+ Az/El, or AzL/ElL on an orbit site) on the
+    left; the round-19 one-line pointing summary on the right.
+- **The frame interior carries only what the image carries**: stars and trails.
+  All text is placed through one collision registry (`claim()`), in priority
+  order — field size, colour key, picked trail's annotations, satellite names,
+  grid labels — and **a piece of text that would overlap another, or lie along
+  another object's trail, is not drawn** (the hover card has it). Nothing is
+  ever printed across something else, except the picked object's own name and
+  tick times, which are forced onto a dark plate.
+- **Keys** (chart focused): `F` fit, `+`/`−` zoom, `R` ruler, `L` names,
+  `T` tracks, `Esc` clears the ruler or the selection.
+
 - Scale set so the FOV fits with a configurable padding (default: FOV occupies 70% of
   the shorter axis, so context outside the field is visible). Wheel zooms about the
   cursor (0.2×–20× relative to fit), drag pans; **double-click re-aims** — the
   clicked sky position becomes the new pointing, centred (round-3 review; drag
-  somewhere, double-click the spot). Fit-to-window lives on the ⤢ toolbar button.
+  somewhere, double-click the spot). Fit-to-window is the Fit button, the zoom
+  readout, or `F`.
 - Orientation: apply `rotDeg` then `flipEW` to `{xi, eta}`. A compass rosette in a
   corner shows N and E arrows *after* the transform, so the user can verify the
   chart matches their frame. Always visible; this is the thing people get wrong.
 - Layers, respecting `settings.chart` and redrawing on `time / obs-changed /
   scan-done / filters-changed / selection-changed / settings-changed / state-loaded`:
-  - **Chart star background (round 15 — adaptive depth, all local, binding).**
-    Stars from `SAT.stars.cone` down to an *effective* magnitude limit. Default
-    is **auto** (`settings.chart.magAuto`): the limit follows the view span D —
-    the diameter in degrees of the circle enclosing the viewport — via the pure
-    helper `SAT.chart.autoMagLimit(D)`:
-    - **D < 3°: 13.0**, served by the LOCAL deep tile set through
-      `SAT.stars.deepField` (round 15; the round-14 online VizieR fetch is
-      REMOVED — no runtime network access, ever). The depth is a measured
-      size trade set in round 16: on 1609 deg² of fetched sky, V≤11 ≈ 1M
-      stars/10 MB, V≤13 ≈ 6M/60 MB, V≤15 ≈ 32M/320 MB, V≤17 ≈ 137M/1.4 GB —
-      m17 proved too heavy and the user chose m13. While tiles load (local
-      server, milliseconds) or when the tile set has not been built, the
-      bundled catalogue draws at its own `localLimit()`; should a tile build be shallower or deeper than
-      this law asks, the dot law keys on the DELIVERED depth
-      (`deepField().magLimit`), never the wanted one.
-    - **D ≥ 3°: clamp(10.5 − 5·log10(D/3), 4.5, 10.5)** — 10.5 at 3°, 9 at 6°,
-      7.5 at 12°, 6 at 24°, floor 4.5 from ~48° up — entirely from the bundled
-      catalogue, so star counts stay bounded as the field grows.
-    The m-limit toolbar button cycles auto → 4.5/6/7.5/9/**10.5**/**13** → auto
-    (round 17: every manual step is exactly deliverable — 10.5 is the bundled
-    catalogue's full depth and 13 the deep tiles'; the legacy m11 step, an
-    aspirational leftover from the m9 Tycho era that the bundled file could
-    only serve at 10.5, is gone. A manual value pins `magLimit` and clears
-    `magAuto`; a saved m11 from an older state falls back to auto on the next
-    press).
-    **Deep tiles are gated to narrow fields (round 17):** `deepField` is
-    consulted only when the view span D < 3° — the same boundary as the auto
-    law — regardless of the pinned limit. A pinned m13 on a wide field draws
-    the bundled catalogue; this is what bounds tile I/O (a 40° view would
-    otherwise churn dozens of tiles through the 16-tile LRU every pan).
+  - **Chart star background (adaptive depth, all local; law re-set in round 24 —
+    binding).** Stars from `SAT.stars.cone` / `SAT.stars.deepField` down to an
+    *effective* magnitude limit. Default is **auto** (`settings.chart.magAuto`):
+    the limit follows the view span D — the diameter in degrees of the circle
+    enclosing the **window** (not the field frame, which fills 70% of it) — via
+    the pure helper `SAT.chart.autoMagLimit(D)`:
+    - **D ≤ 8°: 13.0**, the deep tile set's full depth;
+    - **D > 8°: clamp(13 − 5·log10(D/8), 6.5, 13)** — 12.1 at 12°, 11.0 at 20°,
+      10.1 at 30°, 8.6 at 60°, 7.7 at 90°, floor 6.5 from ~160°.
+    **The law holds the number of stars on screen roughly constant** (~4 000 on
+    an average sky): the sky has ~10^(0.45 m) stars per square degree brighter
+    than m and the view covers ~D² square degrees. Rounds 14–23 used the same
+    slope anchored 4.6 magnitudes shallower (10.5 at 3°, floor 4.5 from 48°),
+    which left 60–420 stars on screen — a 15°×10° frame showed sixty; it now
+    shows ~1 800 to V 10. The user asked for the change ("more stars on wider
+    fields") after the drawing cost was measured: 0.2–0.4 ms a frame at the old
+    counts, **2–4 ms at 2 000–5 300 stars** — the count was never a rendering
+    limit.
+    **Sources.** Above the bundled catalogue's V 10.5 the stars come from the
+    LOCAL deep tile set through `SAT.stars.deepField` (round 15; no runtime
+    network access, ever; V 13 since round 16 — on 1609 deg² of fetched sky,
+    V≤11 ≈ 1M stars/10 MB, V≤13 ≈ 6M/60 MB, V≤15 ≈ 32M/320 MB, V≤17 ≈
+    137M/1.4 GB). While tiles load (local server, milliseconds) or when the
+    tile set has not been built, the bundled catalogue draws at its own
+    `localLimit()`; the dot law keys on the DELIVERED depth, never the wanted
+    one. **Deep tiles serve views narrower than 26°** (`DEEP_MAX_VIEW_DEG`;
+    round 17's gate, 3° until round 24): the law crosses V 10.5 at 25.3°, so
+    past the gate the tiles are not needed, and a wider cone would pull in
+    hundreds of them. A pinned V 13 on a wider view draws the bundled
+    catalogue. `stars.js` keeps up to 128 tiles (~105 kB each) in memory — a
+    16° cone at high declination wraps every RA column of eight or nine dec
+    bands. Measured refresh after a pan: 2–21 ms.
+    **Star budget.** However deep the request, at most `STAR_BUDGET` = 12 000
+    stars are kept from a query — the brightest (`applyStarBudget`; about 40%
+    of them land inside the window) — and the drawn depth is reported as the
+    faintest one kept. In the Milky Way an 8° view holds 40 000 stars to V 13;
+    the budget keeps the frame time flat there (Cygnus 8°×6°: 5 300 on screen
+    to V 10.9, 4 ms a frame).
+    The toolbar's **Stars** select offers auto, 4.5/6/7.5/9/**10.5**/**13**
+    (round 22: a select, where rounds 14–21 cycled a button; round 17: every
+    manual step is exactly deliverable — 10.5 is the bundled catalogue's full
+    depth and 13 the deep tiles'. A manual value pins `magLimit` and clears
+    `magAuto`; a saved m11 from an older state is read as auto). Its first
+    option names the depth actually drawn (`auto · V 10.1`).
     **Star rendering (round 15 — Stellarium-derived, binding).** The mapping
     from magnitude to dot follows Stellarium's `StelSkyDrawer::computeRCMag`
     design, adapted to a fixed-tone canvas (pure helper
@@ -925,6 +1125,29 @@ view and gets the largest default window.
     the All-Sky keeps its own SatObserver dot law and is NOT changed by round
     15). Star names, constellation lines AND constellation names (`constNames`,
     round 11) draw on fields wider than 5°.
+    **Round 23 additions to the star layer** (the dot law above is unchanged):
+    - **Star trails on a parked mount** (`settings.chart.starTrails`, default
+      on, Layers menu). With `track:'mount'` the sky turns under the detector,
+      so over the exposure every star draws a streak — and that streak pattern,
+      not a field of dots, is what the frame shows; the header of this file had
+      always said "the STARS trail" and the chart had never drawn it. Each of
+      the brightest 1 500 drawn stars is carried through the detector frames of
+      the window — the current scan's `[t0, t0 + spanMin]`, or clock … clock +
+      `obs.spanMin` when there is no current scan — sampled every ≤ 2 min; the
+      dot stays at the clock time. Streak alpha falls with length (a 60 s
+      exposure gives crisp 15′ streaks, a 20 min window faint context lines).
+      Nothing is drawn when the field tracks the sky.
+    - **A soft halo** under stars whose dot radius is ≥ 2.6 px (radial gradient
+      to 2.7 × the radius, 30% of the dot's luminance): a hard-edged disc reads
+      as a marker, a star in an image has a skirt.
+    - **Hover readout**: with the cursor within 7 px of a drawn star and no
+      satellite under it, the status line appends `★ [Name] V m.mm` — a star's
+      magnitude is how one judges the depth of a frame.
+    - **"auto" says what it resolved to**: the Stars select's first option reads
+      `auto · V 9.3`, the depth actually delivered (`drawnMag`).
+    - Measured cost of the whole layer in round 23: 0.2–0.4 ms a frame at the
+      60–420 dots the old depth law allowed — which is what made round 24's
+      denser law free.
   - **Milky Way — REMOVED from the chart (round 20).** The gnomonic isophote port
     and its MW toggle are gone at user request; a saved `settings.chart.mw` is
     ignored. The glow survives only in the All-Sky panel (`settings.allsky.mw`,
@@ -936,48 +1159,104 @@ view and gets the largest default window.
     chart direction (via a waypoint 1° along the moon→sun great circle, since the
     sun itself may be over the tangent-plane horizon). (The "moon N° away"
     footer note was removed with the footer in round 19.)
-  - **HUD (round 19 — one line only).** `RA … Dec … · W° × H° (ONE decimal) ·
-    rot N° [· mirrored] [Az/El when altaz] · sidereal on|off`. The zoom factor
-    is not shown, and the former third line — site name, crossing count,
-    selected-object rate, stale-scan warning, moon separation, star-depth
-    state — is REMOVED at user request: the stale warning and per-object rates
-    live in the Crossings window, the depth behaviour in the mA tooltip.
-  - the FOV outline: solid rectangle (or circle) in the accent colour, with the
-    field's angular size labelled on the edges; the region outside is dimmed ~25%.
-  - a grid of RA/Dec lines with labels when `settings.chart.grid` (spacing chosen
-    from the field size: 1°, 10′, 1′ …), plus a scale bar.
+  - **Status line (round 19 wording, round 22 position).** `RA … Dec … · W° × H°
+    (ONE decimal) · rot N° [· mirrored] [Az/El when altaz] · sidereal on|off`,
+    now in the status line under the chart instead of over it. The zoom factor
+    is on its toolbar button. Stale-scan state is shown on the timeline.
+  - **the FOV outline**: accent rectangle with corner brackets (or circle), a
+    centre cross at the pointing, the field's angular size as one label under
+    the bottom-right corner; the region outside is dimmed ~46% so the frame
+    reads as the image. **A circular field is drawn at `tan(R)`**, not `R`
+    (`circTanDeg`): the scan's circle is a true angular radius and the gnomonic
+    projection puts 30° at 33.1 "tangent degrees" — drawn at R (rounds 1–21),
+    a ring of in-field trails lay outside the outline on any wide field. A
+    rectangle is defined on the tangent plane in the scan as here and needs no
+    correction.
+  - a grid of RA/Dec lines when `settings.chart.grid` (spacing chosen from the
+    field size: 1°, 10′, 1′ …), **each labelled where it leaves the frame**,
+    just outside it (inside the viewport edge when the frame does not fit on
+    screen) — found by intersecting the drawn line with the frame, so it is
+    right at any rotation; plus a scale bar and the compass rosette, whose
+    corners are reserved in the collision registry.
+  - **colour key** (`settings.chart.legend`): top-left, only the object types
+    actually on the chart, with counts, and the dashed-line meaning when any
+    trail is eclipsed.
   - **per crossing** (from `SAT.state.chartCrossings()`): its **whole-timespan
     track** at low alpha (0.16) underneath everything — the object's sky path over
     the entire scan window while above the horizon, computed once per scan and
     cached on the crossing (adaptive step, ≤400 points, built ≤30 tracks per frame
     so the post-scan hiccup is spread) — then the scan's fine `path` (tEnter..tExit)
-    as the bright polyline in the object's class colour, the portion already swept
-    (before the current clock time) dimmed;
-    the current-position marker + label follow the extended track at reduced alpha
-    once the object has left the field, so a two-second crossing does not mean a
-    two-second label;
-    the current position at `SAT.clock.getDate()` as a filled square + label;
-    the selected object gets a white ring.
-    **Tracks toggle (round 20)**: `settings.chart.tracks` (default on, toolbar ↗
-    directly after the label toggle, mirroring the All-Sky's) gates BOTH trail
-    layers and the motion arrow; off leaves only markers + labels, for holding a
-    clean field against a frame. Extended tracks are still BUILT with tracks off —
-    the off-field marker position follows them — they are just not drawn.
-    **Label format (round 20)**: `NAME [NORAD]` via the pure exported helper
-    `SAT.chart.satLabel(cr)` — the bracket always prints the full decimal
-    catalogue number (Alpha-5 fields are decoded server-side at parse: 'A0000'
-    arrives as 100000, so the label NEVER shows the letter form). Name-less
-    objects show just `[NORAD]`; a crossing with no norad falls back to the bare
-    name.
-- Interaction: hover shows a readout of cursor RA/Dec (and Alt/Az); click within 8 px
-  of a marker selects that object; click elsewhere deselects; shift-click also
-  re-aims but keeps the view still (both paths mark the scan stale; in alt/az mode
-  the az/el pair is carried along so a parked mount re-aims too).
+    as the bright polyline in the object's type colour, the portion already swept
+    (before the current clock time) dimmed, with:
+    - **time ticks** (`settings.chart.ticks`) at round UTC instants, the finest
+      interval of 0.1 s … 1 h that keeps them ≥ 26 px apart (`tickStepS`), so a
+      2-second LEO streak is ticked in tenths and a GEO drift in minutes;
+    - one **arrowhead** a little past half way (direction of motion);
+    - **dashed** when `shadow === 'umbra'` at closest approach: it crosses the
+      field but reflects no sunlight, and an optical streak is not that object;
+    - the **name** `NAME [NORAD]` (`satLabel`, round 20 format unchanged) set
+      beside the trail's exit end, pushed onward along the motion — i.e.
+      **outside the frame** for a trail that leaves it — then the entry end,
+      then beside either end or the middle (`labelTrail`); an object that sits
+      still on the detector (a GEO dot on a parked mount) is named before any
+      streak;
+    - the current position at `SAT.clock.getDate()` as a filled square, which
+      follows the extended track at reduced alpha once the object has left the
+      field, so a two-second crossing does not mean a two-second marker.
+    The **picked** trail — selected, or under the cursor — is drawn on top with
+    a white under-stroke, the others step back, and it is annotated as a clock:
+    its ticks labelled (every 1st/2nd/5th/10th, evenly), its entry and exit
+    instants printed at its ends.
+    **Tracks toggle (round 20)**: `settings.chart.tracks` gates BOTH trail
+    layers, ticks and the arrowhead; off leaves only markers + names, for
+    holding a clean field against a frame. Extended tracks are still BUILT with
+    tracks off — the off-field marker position follows them.
+    **Density tiers.** Past 150 trails the ticks are dropped (except on the
+    picked trail); past 400 the chart thins everything — 1 px lines at 0.42
+    alpha, no arrowheads, no context tracks except the picked object's, at most
+    30 names. A 30° field over an hour is 1 600 trails; at full weight that is a
+    solid block of colour and 112 ms a frame (measured), thinned it is 23 ms.
+  - **Timeline** (`settings.chart.timeline`): a strip under the chart spanning
+    the scan window `[t0, t0 + spanMin]`, with a UTC axis (`timelineStepS`), one
+    bar per charted crossing from entry to exit in its type colour (lanes packed
+    by `packLanes`), and the clock as a playhead (parked at the edge, pointing
+    out, when the clock is outside the window). **Press or drag** moves the
+    clock (`SAT.clock.setDate`); **click a bar** selects that object and jumps
+    to its closest approach; hovering a bar picks the trail on the chart. A
+    stale scan dims the bars and says so. WHEN is half of an identification and
+    the chart alone only shows where.
+  - **Ruler** (toolbar, or `R`): drag along a streak. The two ends are stored
+    as SKY positions (so the line stays on its stars under zoom, pan and a
+    running clock); the panel shows length, position angle both ways (a streak
+    has no direction), and the **four predicted trails that match best**, each
+    with its offset from the streak's midpoint and the angle between them
+    (`rankTrails`: one streak-length of offset counts like 10° of angle; angles
+    compared modulo 180° on the detector, so the ranking is right under any
+    rotation and for a parked mount). Clicking a row selects that object.
+  - **Parked mount, RA/Dec pointing.** The scan converts the RA/Dec to alt/az
+    once, at its start, and holds it; while that scan is current the chart
+    holds the same pair (`parkedAzEl`) and reads `rotDeg` at the same instant
+    (`scanRefMs`). Re-deriving the alt/az from the RA/Dec at every clock time,
+    as before, re-aimed the "parked" mount whenever the clock moved.
+- Interaction: moving the cursor shows RA/Dec (and Alt/Az) in the status line.
+  **A trail can be hovered and clicked anywhere along its length** — within 7 px
+  of its polyline — as well as on its marker (8 px): hover picks it and opens
+  the **hover card** (name, type and class; entry → exit and duration; the
+  instant at the hovered point; rate, position angle and trail length — on the
+  detector when the mount is parked; magnitude, range, sunlit/eclipsed; element
+  age and the expected error); click selects, click elsewhere deselects;
+  shift-click re-aims but keeps the view still, double-click re-aims centred
+  (both mark the scan stale; in alt/az mode the az/el pair is carried along so
+  a parked mount re-aims too).
 - Performance: dirty flag + rAF, devicePixelRatio aware, `'win-resize'` listener.
   Star cone results are cached and only re-queried when the tangent point or radius
-  changes by more than 10% of the field.
+  changes by more than 10% of the field. A trail is two strokes (swept, to come),
+  not one per segment.
 - Expose: `SAT.chart = { init, requestRender, fitView, autoMagLimit, starDot,
-  satLabel }` (the last three pure, unit-tested in tools/test_chart.js).
+  satLabel, tickStepS, tickLabel, timelineStepS, packLanes, lineAngleDiff,
+  rankTrails, circTanDeg, applyStarBudget }` (all but the first three pure, unit-tested in
+  tools/test_chart.js, which also drives the real mouse and key handlers and
+  asserts that no two pieces of chart text overlap).
 
 ### SAT.ui.crossings.init(bodyEl, win) — AGENT T (js/crossings.js) — MAIN LIST
 
@@ -1090,8 +1369,9 @@ CelesTrak tab with NORAD IDs (≤ 20; gp.php answers one CATNR per
 request) / INTLDES–COSPAR (whole launch; a piece letter narrows it) / Name-contains
 queries via `GET /api/celestrak/query`, merged additively under the `celestrak`
 source tag (own ✕ clear button, own line in the freshness block, rehydrated via
-`catalogRefs` like Space-Track and McCants). Round 21 adds the CelesTrak **full
-catalogue** (`GET /api/celestrak/full`, below): the whole set is not a subset,
+`catalogRefs` like Space-Track and McCants). Round 21 added the CelesTrak **full
+catalogue** (`GET /api/celestrak/full`, below; rebuilt in round 22 on launch-decade
+queries after the bulk files proved unreachable): the whole set is not a subset,
 so it carries none of the round-1 trap — the ban stays on *group* fetches.
 
 **Top billing (round 21): two full-catalogue buttons, each naming its
@@ -1184,10 +1464,9 @@ New or changed:
 ### Catalog numbers past 100000 — do not regress this
 
 The public catalogue passed NORAD 100000 in June 2026, so **every provider is fetched
-as `FORMAT=json` (OMM), never `FORMAT=tle`/`3le`** (one documented exception:
-`/api/celestrak/full`'s legacy `catalog.txt` fallback — CelesTrak publishes no
-full-catalogue OMM query at all; see that endpoint's bullet. The parsed `norad`
-is still the full integer, via `catnum()`'s Alpha-5 decode). The authoritative NORAD id is the
+as OMM — `FORMAT=json`, or `FORMAT=csv` for `/api/celestrak/full` — never
+`FORMAT=tle`/`3le`** (round 22 removed the one exception, the legacy
+`catalog.txt` fallback). The authoritative NORAD id is the
 integer `NORAD_CAT_ID` field; the TLE line pair is taken from the record when present
 or synthesized by the server-side `omm_to_tle` writer, which encodes columns 3–7 as
 Alpha-5 for 100000–339999 and writes the placeholder `'00000'` above that (checksums
@@ -1199,21 +1478,38 @@ for SATCAT/qsmag and the thing the user types into a search box. Port `catnum()`
 This matters more here than in SatObserver: that app imports hand-picked objects,
 whereas this one runs against the **whole** catalogue, where the high-numbered recent
 launches and analyst objects are exactly the unidentified trails people are chasing.
-- `GET /api/celestrak/full[?refresh=1]` (round 21) — the no-account full
-  catalogue. CelesTrak's gp.php deliberately offers no full-catalogue query, so
-  this walks the bulk files under `/pub/TLE/`: `catalog.csv` first (modern OMM
-  field names, full integer `NORAD_CAT_ID`, parsed by `parse_omm_csv` through
-  the same `omm_to_tle` synthesis path as the JSON endpoints), then the legacy
-  `catalog.txt` TLE file — **the one documented exception to the FORMAT=json
-  rule above**. By CelesTrak's stated policy the TLE format never carries the
-  6-digit objects catalogued after 2026-07-11, so a `catalog.txt`-sourced
-  payload says so in `notes` (and the UI shows it); Space-Track remains the
-  complete set. Enriched and counted exactly like `/api/catalog/full` (shared
-  helper `enrich_full_catalog`); cached as `celestrak_full.json`, fresh < 6 h,
-  stale fallback with `"stale":true`. The 6 h window is load-bearing
-  politeness, not just economy: CelesTrak temp-blocks an IP that re-downloads
-  a bulk file before its content updates (403 with a ~2 h cooldown), and the
-  error message names that cooldown when it happens.
+- `GET /api/celestrak/full[?refresh=1]` (round 22) — the no-account full
+  catalogue, **assembled from gp.php queries**. gp.php offers no all-objects
+  query, and the bulk files round 21 used (`/pub/TLE/catalog.csv`,
+  `catalog.txt`) answer 403 from any address CelesTrak has rate-blocked for
+  them — measured permanent on a shared exit address, and the reason this
+  endpoint "always failed". But `INTDES` matches by **prefix**: a three-digit
+  launch decade (`INTDES=202`) returns every object launched in the 2020s. One
+  query per decade since `195`, plus `GROUP=analyst` for the objects with no
+  international designator, is the whole catalogue in nine requests
+  (`celestrak_full_parts()`; 32 912 objects, 4.7 MB of OMM CSV, 2026-11-15; the
+  decade list grows by itself in 2030), parsed by `parse_omm_csv` through the
+  same `omm_to_tle` synthesis path as the JSON endpoints — 6-digit and analyst
+  objects included. Three rules from CelesTrak's usage policy shape it, and all
+  three are **binding**:
+  - **One download per update.** CelesTrak refreshes GP data every 2 h and
+    answers 403 to a repeat of a query it already served in that cycle
+    (enforced since 2026-03); 50 HTTP errors in 2 h firewalls the address. So
+    nothing is re-requested inside `CELESTRAK_UPDATE_S` (2 h): the assembled
+    payload is served as-is in that window **even on `refresh=1`** (with a note
+    saying so), and each part is cached on its own (`celestrak_full_parts.json`)
+    so a load that failed at part 6 resumes at part 6. The same floor applies to
+    `/api/celestrak/query` and `/api/celestrak/tle`.
+  - **Stop on the first non-200.** No retry, no next part. The reason CelesTrak
+    gives in the error body (`http_error_text`, tags stripped) is passed to the
+    user, with how many parts are saved.
+  - **Sequential**, `CELESTRAK_PAUSE_S` between requests.
+  Enriched and counted exactly like `/api/catalog/full` (`enrich_full_catalog`);
+  cached as `celestrak_full.json`, served without a request for 6 h
+  (`CATALOG_FRESH_S`); its `fetchedUnix` is that of its **oldest** part. On a
+  failure with an older copy on disk, that copy is served with `"stale":true`
+  and the reason in `notes`. Pinned by `tools/test_server.py` (36 checks, no
+  network).
 - `GET /api/satcat/bulk[?refresh=1]` — the whole CelesTrak SATCAT
   (`https://celestrak.org/pub/satcat.csv`), parsed to `{norad: {intl, rcs, name,
   launch, owner, opStatus}}`. Cached 30 d as `satcat_bulk.json`. This is what

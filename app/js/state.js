@@ -75,9 +75,10 @@
   function defaultSettings() {
     return {
       chart: {
-        stars: true, starNames: false, constLines: true, constNames: false,
+        stars: true, starTrails: true, starNames: false, constLines: true, constNames: false,
         sunMoon: true, mw: false, grid: true, magAuto: true, magLimit: 9.0,
-        labels: true, padFrac: 0.7,
+        labels: true, tracks: true, ticks: true, legend: true, timeline: true,
+        padFrac: 0.7,
       },
       allsky: { eastLeft: true, elStep: 30, stars: true, sunMoon: true, mw: false,
                 starNames: false, constLines: false, constNames: false },

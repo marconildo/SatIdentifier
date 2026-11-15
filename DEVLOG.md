@@ -990,18 +990,243 @@ moves. The label was the bug: "Fetch full SATCAT" reads as a catalogue loader.
   load-time status line via payload `notes[]`, shown only when a load
   actually came from `catalog.txt`. test_ports pins the terse wording.
 
+### Round 22 (2026-11-15) — scan engine, CelesTrak full catalogue, Sky Chart redesign
+
+Three requests after four months of use: is there anything left in the crossing
+calculator, for speed or for accuracy; the CelesTrak full load "is always 403";
+and redesign the Sky Chart, "what I want upgraded most".
+
+**1. The scan engine — measured first, and the measurement changed the brief.**
+
+Profiled on the 32 912-object catalogue of the day, single thread, thirteen
+scenarios from a 1-minute frame to a 24 h GEO stare, ground and orbit
+(`scratchpad/bench.js`): 106 s in total, 80–90% of it stage 2 propagating every
+survivor at every coarse step. Before optimising anything, one suspicion was
+tested and confirmed:
+
+> With the default 1 s fine step, **the engine missed any crossing shorter than
+> a second** unless a sample happened to land in it. 0.2° field, two hours: 5
+> found, 14 real. 0.5°: 20 of 32. 1°: 26 of 29. Every miss a fast LEO pass.
+
+That is the tool's own use case — a telescope field and a LEO streak — failing
+two times in three, silently. So the rewrite had to fix recall, not just speed,
+and both come from one idea: the **distance from the satellite to the
+sightline, in km, can only shrink as fast as things move**. `clearTime()` divides
+the gap by the largest closing speed physics allows (osculating perigee speed,
+observer speed, boresight turn rate — the last two *measured* off the per-step
+tables, so no case analysis by observer or tracking mode) and returns a time in
+which the object provably cannot be in the field.
+
+- **Stage 2** jumps by that time: a LEO object behind the Earth is not looked
+  at again for 25 minutes. 3–10% of the grid is propagated.
+- **Stage 3** has no grid at all. It walks each window by the same bound while
+  far, by `½ · distance-to-edge / speed-toward-it` when near, bisects every
+  in/out change to 10 ms, and finds closest approach by golden section. A
+  crossing cannot fall between samples because there are no samples to fall
+  between.
+
+Result: **106 s → 7.2 s** over the thirteen scenarios (24 h GEO stare 34.5 →
+2.0 s; 6 h narrow field 7.7 → 0.33 s), and against an independent 5 ms
+brute-force adjudication (`scratchpad/ref.js`: different code path through
+`frames.js`, iterated light time) the new engine scored **0 wrong, 0 missed,
+worst edge error 10 ms on every scenario**; the old one missed 6–84 per
+scenario sample.
+
+Four accuracy changes rode along, each found by that adjudication or on the way:
+
+- **Light time** is now applied (`r − v·ρ/c`): 5″ for LEO, 2″ for GEO,
+  along-track, systematic. The contract had waved it off as "≤ 0.005″ of
+  motion" — that was the Earth's rotation during the light time, not the
+  satellite's own travel. Positions are now astrometric, which is what a plate
+  solution measures; aberration stays off on both sides. `look()` on the main
+  thread got the same correction so the chart's tracks agree with the scan's.
+- **Horizon.** Stage 3 never tested it, so a field hanging below the horizon
+  reported the below-horizon stretch whenever a neighbouring coarse sample was
+  above. Membership now requires elevation ≥ max(0, minEl).
+- **LVLH rectangle.** The worker held a rectangular field at a constant angle
+  to celestial north; a body-fixed sensor's rectangle turns with the orbit. The
+  detector is now three vectors carried rigidly in the mount's frame.
+- **Co-located objects.** The other ISS modules carry the station's elements.
+  Seen from an ISS observer their range is zero, and the old code built the
+  observer's clock from a Julian date and the target's from an offset — 40 µs
+  apart, 0.3 m, which was the *entire* topocentric vector: 13 518 fragment
+  "crossings" in one 30-minute scan. Both clocks are now formed identically.
+
+Two things the harness itself had wrong, fixed: it parsed catalogue numbers with
+`parseInt`, so every 6-digit object became `o_NaN` and the "independent
+recompute" looked up the wrong object (a crossing "160° outside the field"); and
+it scanned from the *newest* element epoch, which one pre-dated element set had
+dragged 17 days from everything else. `test_scan.js` now reads the app's own
+disk cache, decodes Alpha-5, scans from the median epoch, and gained [r]
+recall-vs-brute-force (23 of 23, 18 of them under a second), [k] the bound
+walked instant by instant (12 000 bounds, ~900 000 instants, 0 violations) and
+[h] the horizon rule.
+
+**2. CelesTrak — the 403 was real, permanent here, and not ours to wait out.**
+
+The round-21 endpoint walked `/pub/TLE/catalog.csv` then `catalog.txt`. Both
+return CelesTrak's "excessive downloads … access temporarily blocked" page for
+this network's exit address (the direct route too) — the same block round 21
+met in August, so "temporary" is permanent on a shared address. `gp.php` is not
+blocked, and probing it found the way in: **`INTDES` matches by prefix**.
+`INTDES=1958` returns the year; `INTDES=195` the decade. Eight decade queries
+plus `GROUP=analyst` returned 32 912 objects (1 531 six-digit, 575 analyst) —
+more than the Space-Track pull of July — in ~25 s.
+
+CelesTrak's usage policy was read before writing the fetcher, and three of its
+rules are now code: one download per 2-hour update (a repeat is a 403, so Force
+refresh inside the window serves the saved copy and says why; parts are cached
+individually so a failed load resumes without re-asking); stop on the first
+non-200 and show CelesTrak's own reason; sequential with a pause. Every decade
+was downloaded exactly once during development and the tests run on fixtures.
+
+**3. The Sky Chart.**
+
+The old panel floated a row of two-letter buttons and a HUD over the sky, named
+every object at its *current* position (so names piled up wherever the clock
+happened to be, mostly off the field), let trails be clicked only at that one
+marker, and said nothing about *when*. Redesigned around one job — hold it
+against a frame:
+
+- four stacked parts (labelled toolbar, chart, timeline, status line), nothing
+  over the sky;
+- the frame interior shows what an image shows; names sit outside it at each
+  trail's end through a collision registry, so none overlaps another or lies
+  along someone else's trail (a test fans twelve trails through one point and
+  asserts 12 names, 0 overlaps — it caught a diagonal-gap bug on its first run);
+- every trail is a clock: UTC ticks from tenths of a second to minutes;
+- hover/click anywhere along a trail; a hover card with what one compares
+  against a streak;
+- **dashed = in the Earth's shadow.** On the very first test scene this showed
+  that nearly every LEO trail in the field was eclipsed — none could have been
+  an optical streak — which the old chart drew exactly like the lit ones;
+- a timeline of the scan window with one bar per crossing; drag = clock, click
+  = that object at closest approach;
+- a ruler that measures a streak and ranks the predicted trails against it.
+
+Also fixed while there: a circular field's outline was drawn at R instead of
+tan R (a ring of in-field trails outside the outline at 30°); a parked mount
+with an RA/Dec pointing was re-aimed whenever the clock moved; the crossings
+window's "≈ N k props" estimate never showed (it compared an object to a
+number). A 1 621-trail field renders in 23 ms, down from 112, by thinning.
+
+Verified in a real browser (headless Chrome driven over the DevTools protocol,
+real mouse events): scan in the running app 0.13–0.59 s for 1 min–1 h on the
+full catalogue; hover, click-select, ruler drag and timeline click all
+exercised and screenshotted.
+
+### Round 23 (2026-11-15) — the star layer
+
+"Any improvement on the stars layer?" Measured before touching anything, and the
+measurement redirected the work twice.
+
+**Not speed.** The first timing said 16.6 ms a frame with or without stars —
+which was the display's refresh interval, not the renderer. Timed with
+synchronous renders the whole layer costs **0.2–0.4 ms** (60–420 dots: the auto
+depth law keeps the count low on purpose). Nothing to optimise; nothing was.
+
+**Accuracy, where nobody had looked.** A fourteen-star truth table (SIMBAD
+J2000 place + proper motion, carried to the catalogue's epoch) against the
+bundled Gaia catalogue:
+
+```
+Arcturus 63.4"   Procyon 36.4"   Sirius 30.6"   Vega 28.0"   Capella 20.2"
+Rigel 17.0"   Betelgeuse 15.2"   Polaris 14.5"   Deneb 5.2"   Altair 4.3"
+61 Cyg A 0.5"   Barnard's star 1.0"   Alcyone 0.5"   Mizar 0.2"
+```
+
+The faint, fast stars were right and the bright, famous ones were wrong. Cause:
+Gaia DR3 has no stars brighter than G ≈ 3, so the builder adds them whole from
+`starcat.js` — J2000 places rounded to 0.01°, no proper motion — a file that
+exists for photometry and an all-sky chart. Arcturus has moved 60″ since 2000.
+On a 1° field that is nine pixels, on the stars one anchors a frame by.
+
+Fixed at the source: `refine_bright()` in `make_starcat.py` recognises those
+stars by their 0.01° lattice coordinates and places them from Hipparcos at the
+catalogue epoch; it runs in every build and `--refine-bright` repairs files in
+place. Applied to `stars_deep.bin` (70 stars) and to the deep tiles (105 stars
+in 86 tiles, backed up first); a second run is a byte-identical no-op. The table
+now reads **≤ 0.2″ on every row**. (The CDS VizieR host answered 404 to every
+query that day; the builder now carries a mirror list. ESA's archive was
+unreachable too.)
+
+**Then the layer itself:**
+
+- **Star trails on a parked mount.** The chart's own header had said since
+  round 1 that on a parked mount "the STARS trail" — and it drew dots. Each
+  star is now carried through the detector frames of the exposure window: a
+  60 s exposure shows 15′ streaks with GEO objects as dots among them, which is
+  what the frame looks like.
+- **Hover readout** (`★ Alnilam  V 1.70` in the status line), a **soft halo**
+  under bright stars, and the Stars select saying what `auto` resolved to
+  (`auto · V 9.3`).
+
+Not done, and why: star colours (the catalogue carries no colour index — it
+would mean re-fetching 549 037 + 5.6 M stars for one byte each); a denser auto
+depth law and deep tiles on fields wider than 3° (both were settled with the
+user in rounds 14–17).
+
+Tests: `test_stars.js` [5b] pins the truth table against the bundled file;
+`tools/test_starcat.py` (25 checks, no network) pins the repair; `test_chart.js`
+[17] pins the trails, the hover readout and the depth label — and its stub now
+records window-level listeners, so the click and ruler tests of round 22 finish
+their drags for real.
+
+### Round 24 (2026-11-15) — more stars on wider fields
+
+Round 23 had offered this and left it as the user's call, since the depth law
+and the 3° tile gate were both settled with them in rounds 14–17. The answer
+came back in five words.
+
+The old law, `10.5 − 5·log10(D/3)` floored at 4.5, kept **60–420 stars** on
+screen. That was chosen when stars were thought expensive; round 23's
+measurement had just shown the layer costs 0.2–0.4 ms. So the law is re-anchored,
+same slope, 4.6 magnitudes deeper — `13 − 5·log10(D/8)`, floor 6.5 — which holds
+the on-screen count near constant (the sky has ~10^(0.45 m) stars per square
+degree, the view ~D² square degrees):
+
+```
+field (view)        before          after
+6° × 5°   (12°)     V 7.4            V 12.0     4 100 stars
+15° × 10° (26°)     V 5.8, ~60       V 10.1-10.4, ~1 800
+40° × 30° (70°)     V 4.5            V 8.2      5 100 (Cygnus)
+```
+
+Three things had to move with it:
+
+- **The tile gate**, 3° → 26°: the law needs more than the bundled V 10.5 up to
+  a 25.3° view. `stars.js` keeps 128 tiles instead of 16 (they average 105 kB;
+  the "~1 MB" in the comment dated from the m17 experiment).
+- **A star budget** of 12 000 per query, brightest first. Without it Cygnus at
+  8° × 6° asks for 40 000 stars; with it, 5 300 land on screen to V 10.9 and the
+  Stars control says so (`auto · V 10.9`).
+- The law's D is the *window's* enclosing circle, not the field's — the field
+  fills 70% of the window — which the contract now states, because it is why a
+  6° field reads "V 12.0" and not 13.
+
+Measured in the running app: **2–4 ms a frame** at 1 800–5 300 stars, 2–21 ms to
+refresh after a pan, no render warnings at either pole (the 10° × 8° south-pole
+view pulls every RA column of the polar bands: 3 950 stars, 2.7 ms). One note
+for whoever measures this next: in headless Chrome a queued animation frame can
+sit unfired, which makes a synchronous-render timing loop read 0 ms — drain the
+queue first.
+
 ## 13. Running the checks
 
 ```sh
 node tools/test_frames.js       # coordinate frames — the cross-check
-node tools/test_propagate.js    # topocentric solution, both angular rates
+node tools/test_propagate.js    # topocentric solution, both rates, light time
 node tools/test_stars.js        # star catalogue + photometry tiers
-node tools/test_scan.js         # scan engine, incl. Stage 1 soundness
-node tools/test_chart.js        # projection and orientation
+node tools/test_scan.js         # scan engine: cull soundness, recall vs brute
+                                # force, the clear-time bound, the horizon rule
+                                # (reads the app's data/cache/ catalogue; ~25 s)
+node tools/test_chart.js        # projection, orientation, ticks, timeline, ruler,
+                                # label collisions, mouse and key handlers
 node tools/test_crossings.js    # table, sorting, filters, export
 node tools/test_pointing.js     # parsing, mode-switch round trips
 node tools/test_ports.js        # sources / satinfo / allsky
 python3 tools/test_server.py    # backend catalogue fetching (network stubbed)
+python3 tools/test_starcat.py   # catalogue builder: bright-star astrometry
 ```
 
-All green as of 2026-07-21.
+All green as of 2026-11-15 (round 24).

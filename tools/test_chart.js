@@ -36,26 +36,51 @@ const ctx2d = {
   fill: rec('fill'), stroke: rec('stroke'),
   fillRect: rec('fillRect'), strokeRect: rec('strokeRect'),
   fillText: rec('fillText'), strokeText: rec('strokeText'),
-  measureText: () => ({ width: 20 }),
+  setLineDash: rec('setLineDash'),          // eclipsed trails are dashed (round 22)
+  createRadialGradient: () => ({ addColorStop: () => {} }),   // bright-star halo (round 23)
+  measureText: (t) => ({ width: 6 * String(t).length }),
 };
+// every haloText() goes through strokeText+fillText; record WHAT was written and
+// where, so the label-collision tests can check real placements
+const texts = [];
+const _ft = ctx2d.fillText;
+ctx2d.fillText = function (t, x, y) { texts.push({ t: String(t), x: x, y: y }); _ft(); };
+const listeners = [];                    // [{el, type, fn}] — lets tests fire real handlers
 function stubEl() {
-  return {
-    style: {}, className: '', textContent: '',
+  const el = {
+    style: {}, className: '', textContent: '', children: [], firstChild: null,
     classList: { toggle: () => {}, add: () => {}, remove: () => {} },
-    appendChild: () => {}, addEventListener: () => {}, setAttribute: () => {},
+    appendChild: (c) => { el.children.push(c); }, removeChild: () => {},
+    addEventListener: (type, fn) => { listeners.push({ el: el, type: type, fn: fn }); },
+    setAttribute: () => {}, contains: () => false, focus: () => {},
     getContext: () => ctx2d,
     getBoundingClientRect: () => ({ left: 0, top: 0, width: 900, height: 700 }),
   };
+  return el;
+}
+function fire(el, type, ev) {
+  listeners.filter((l) => l.el === el && l.type === type).forEach((l) => l.fn(Object.assign({
+    button: 0, clientX: 0, clientY: 0, preventDefault: () => {}, shiftKey: false,
+  }, ev || {})));
 }
 global.window = global;
 global.devicePixelRatio = 2;            // exercise the HiDPI path
 global.requestAnimationFrame = (fn) => fn();   // render synchronously, so it can throw
 global.ResizeObserver = function () { this.observe = () => {}; };
+const created = [];                      // every element, in creation order
 global.document = {
   head: { appendChild: () => {} },
   getElementById: (id) => styleEls[id] || null,
-  createElement: stubEl,
-  createTextNode: () => ({}),
+  createElement: (tag) => { const e = stubEl(); e.tag = tag; created.push(e); return e; },
+  createTextNode: (t) => ({ text: t }),
+  addEventListener: () => {},
+};
+// window-level drag listeners: recorded, so a test can finish a drag with mouseup
+global.addEventListener = (type, fn) => { listeners.push({ el: global, type: type, fn: fn }); };
+global.removeEventListener = (type, fn) => {
+  for (let i = listeners.length - 1; i >= 0; i--) {
+    if (listeners[i].el === global && listeners[i].type === type && listeners[i].fn === fn) listeners.splice(i, 1);
+  }
 };
 global.satellite = require(path.join(APP, 'vendor', 'satellite.min.js'));
 global.SAT = { ui: {} };
@@ -511,20 +536,44 @@ console.log('\n[11] extended pass track');
 console.log('\n[12] adaptive star depth (rounds 14/15)');
 {
   const A = C.autoMagLimit;
-  ok('law: 2° field -> 13 (deep tiles)', A(2) === 13, 'got ' + A(2));
-  ok('law: 2.99° -> 13, strict boundary', A(2.99) === 13, 'got ' + A(2.99));
-  ok('law: 3° -> 10.5 (local catalogue limit)', A(3) === 10.5, 'got ' + A(3));
-  ok('law: 6° -> 9.0', A(6) === 9, 'got ' + A(6));
-  ok('law: 12° -> 7.5', A(12) === 7.5, 'got ' + A(12));
-  ok('law: 24° -> 6.0', A(24) === 6, 'got ' + A(24));
-  ok('law: 60° -> floor 4.5', A(60) === 4.5, 'got ' + A(60));
+  // Round 24: the law holds the on-screen star count roughly constant — V 13 up
+  // to an 8 deg view, then 13 - 5*log10(D/8) down to a 6.5 floor.
+  ok('law: 2° view -> 13 (deep tiles)', A(2) === 13, 'got ' + A(2));
+  ok('law: 8° view -> still 13', A(8) === 13, 'got ' + A(8));
+  ok('law: 12° -> 12.1 (was 7.5 before round 24)', A(12) === 12.1, 'got ' + A(12));
+  ok('law: 20° -> 11.0', A(20) === 11, 'got ' + A(20));
+  ok('law: 30° -> 10.1', A(30) === 10.1, 'got ' + A(30));
+  ok('law: 60° -> 8.6 (was the 4.5 floor)', A(60) === 8.6, 'got ' + A(60));
+  ok('law: 90° -> 7.7', A(90) === 7.7, 'got ' + A(90));
+  ok('law: 170° -> floor 6.5', A(170) === 6.5, 'got ' + A(170));
+  ok('law: needs nothing past the bundled catalogue beyond the 26° tile gate',
+    A(26) <= 10.5, 'got ' + A(26));
   let mono = true, prev = Infinity;
-  for (let d = 3; d <= 90; d += 0.25) {
+  for (let d = 1; d <= 180; d += 0.25) {
     const m = A(d);
     if (m > prev + 1e-9) mono = false;
     prev = m;
   }
-  ok('law: monotone non-increasing beyond 3°', mono);
+  ok('law: monotone non-increasing', mono);
+  // constant count: the sky holds ~10^(0.45 m) stars/deg^2, the view ~D^2 deg^2
+  const cnt = (d) => Math.pow(10, 0.45 * (13 - 5 * Math.log10(d / 8))) * d * d;
+  // (the slope is 5 where exactly constant would be 4.4, so the count eases off
+  // by 10^0.25 per decade of field — deliberately the conservative side)
+  ok('law: the star count at 10° and at 100° agree within a factor of 2',
+    cnt(10) / cnt(100) > 1 && cnt(10) / cnt(100) < 2, (cnt(10) / cnt(100)).toFixed(2));
+
+  // the star budget: a crowded field keeps its brightest stars and says how deep
+  {
+    const pool = [];
+    for (let k = 0; k < 100; k++) pool.push({ mag: 13 - (k * 37 % 100) / 10 });
+    const few = pool.slice(0, 10);
+    ok('budget: a field under the budget is left alone (and unsorted)',
+      C.applyStarBudget(few, 50) === null && few.length === 10 && few[1].mag === pool[1].mag);
+    const cut = C.applyStarBudget(pool, 25);
+    ok('budget: a crowded field keeps exactly the brightest N',
+      pool.length === 25 && pool.every((q) => q.mag <= cut + 1e-9), `${pool.length} kept, to V ${cut}`);
+    ok('budget: and reports the depth it cut to', Math.abs(cut - 5.5) < 1e-9, String(cut));
+  }
 
   // ---- wiring: instrumented SAT.stars with a deep field that we control
   const T0 = Date.parse('2026-07-21T22:00:00Z');
@@ -560,8 +609,8 @@ console.log('\n[12] adaptive star depth (rounds 14/15)');
   SAT.state.scan = { crossings: [], stale: false };
   SAT.state.visibleCrossings = () => [];
   SAT.state.chartCrossings = () => [];
-  // 1.5° x 1.0° FOV in a 900x700 window: the enclosing view span is ~2.3° < 3°,
-  // so auto mode wants the m17 online depth. Move the pointing 2° from wherever
+  // 1.5° x 1.0° FOV in a 900x700 window: the enclosing view span is ~2.3°,
+  // so auto mode wants the full tile depth. Move the pointing 2° from wherever
   // the last render left the star cache, so ensureStars must re-query.
   Object.assign(SAT.state.obs, {
     mode: 'radec', raDeg: RA0 + 2, decDeg: DEC0, track: 'sky',
@@ -611,8 +660,17 @@ console.log('\n[12] adaptive star depth (rounds 14/15)');
     deepCalls.length === deeps1 && wideMag < 10.5 + 1e-9 && wideMag >= 4.5,
     'cone mag ' + wideMag);
 
-  // round 17: a pinned deep limit obeys the narrow-field gate — wide views
-  // must never touch the tiles, however deep the pin.
+  // round 24: a 6 x 4 deg field (an ~11 deg view) used to stay on the bundled
+  // catalogue at V ~7.7; it now asks the tiles for V 12.3
+  const deepsMid = deepCalls.length;
+  Object.assign(SAT.state.obs, { fovWDeg: 6, fovHDeg: 4, raDeg: RA0 + 12 });
+  C.fitView();
+  ok('a 6° field in auto mode now draws from the deep tiles',
+    deepCalls.length === deepsMid + 1 && deepCalls[deepCalls.length - 1].mag === 12.3,
+    (deepCalls.length - deepsMid) + ' deep calls, mag ' + (deepCalls[deepCalls.length - 1] || {}).mag);
+
+  // round 17's gate, at 26 deg since round 24: a pinned deep limit on a view
+  // wider than that must never touch the tiles, however deep the pin.
   const deeps2 = deepCalls.length;
   Object.assign(SAT.state.settings.chart, { magAuto: false, magLimit: 13 });
   Object.assign(SAT.state.obs, { fovWDeg: 30, fovHDeg: 20, raDeg: RA0 + 4 });
@@ -682,6 +740,245 @@ console.log('\n[14] satLabel — marker label format (round 20)');
   ok('name-less object shows just the bracket', L({ norad: 41765 }) === '[41765]');
   ok('norad-less crossing falls back to the bare name', L({ name: 'UNKNOWN' }) === 'UNKNOWN');
   ok('empty crossing yields empty string', L({}) === '');
+}
+
+// ---------------------------------------------------------------- test 15
+console.log('\n[15] round 22 — trail ticks, timeline axis, lanes, ruler (pure helpers)');
+{
+  // ticks: the finest interval that keeps them >= 26 px apart
+  ok('2 s streak 700 px long is ticked in tenths', C.tickStepS(700, 2) === 0.1, String(C.tickStepS(700, 2)));
+  ok('3 s streak 770 px long -> 0.2 s (0.1 would be 25.7 px)', C.tickStepS(770, 3.17) === 0.2,
+    String(C.tickStepS(770, 3.17)));
+  ok('60 s trail 600 px long -> 5 s', C.tickStepS(600, 60) === 5, String(C.tickStepS(600, 60)));
+  ok('20 min GEO drift 300 px long -> 2 min', C.tickStepS(300, 1200) === 120, String(C.tickStepS(300, 1200)));
+  ok('a trail too short for two ticks gets none', C.tickStepS(10, 0.5) === 0 && C.tickStepS(0, 5) === 0);
+  const T = Date.UTC(2026, 10, 15, 12, 30, 7, 400);
+  ok('tick label, tenths', C.tickLabel(T, 0.2) === ':07.4', C.tickLabel(T, 0.2));
+  ok('tick label, seconds', C.tickLabel(T - 400, 5) === ':07', C.tickLabel(T - 400, 5));
+  ok('tick label, minutes', C.tickLabel(T, 120) === '12:30', C.tickLabel(T, 120));
+  ok('clock format', C._fmtClock(T) === '12:30:07.4' && C._fmtClock(T, 2) === '12:30:07.40', C._fmtClock(T));
+  ok('clock format carries a rounded-up second',
+    C._fmtClock(Date.UTC(2026, 10, 15, 12, 30, 59, 980)) === '12:31:00.0',
+    C._fmtClock(Date.UTC(2026, 10, 15, 12, 30, 59, 980)));
+
+  // timeline axis: labels >= ~90 px apart
+  ok('1 min window, 1000 px -> 10 s ticks', C.timelineStepS(60, 1000) === 10, String(C.timelineStepS(60, 1000)));
+  ok('30 min window, 1000 px -> 5 min ticks', C.timelineStepS(1800, 1000) === 300, String(C.timelineStepS(1800, 1000)));
+  ok('24 h window, 1000 px -> 3 h ticks', C.timelineStepS(86400, 1000) === 10800, String(C.timelineStepS(86400, 1000)));
+
+  // lanes: no overlap while lanes are free, then the lane that frees first
+  const lanes = C.packLanes([{ x0: 0, x1: 50 }, { x0: 10, x1: 20 }, { x0: 30, x1: 40 }, { x0: 60, x1: 70 }], 4, 1);
+  ok('overlapping bars go to separate lanes, freed lanes are reused',
+    JSON.stringify(lanes) === '[0,1,1,0]', JSON.stringify(lanes));
+  const full = C.packLanes([{ x0: 0, x1: 50 }, { x0: 1, x1: 30 }, { x0: 2, x1: 40 }], 2, 1);
+  ok('with every lane busy, the one that frees first is doubled up',
+    JSON.stringify(full) === '[0,1,1]', JSON.stringify(full));
+
+  // ruler: a streak has no direction — angles compare modulo 180
+  ok('angle difference is modulo 180', C.lineAngleDiff(10, 190) === 0 && C.lineAngleDiff(350, 10) === 20 &&
+    C.lineAngleDiff(0, 90) === 90 && Math.abs(C.lineAngleDiff(95, 0) - 85) < 1e-9);
+  const mk = (id, pts) => ({ cr: { satId: id }, pts: pts.map((q, i) => ({ x: q[0], y: q[1], t: i * 1000 })) });
+  const trs = [
+    mk('parallel-far', [[0, 300], [400, 300]]),            // right angle, 200 px off
+    mk('crossing', [[200, 0], [200, 400]]),                // through the midpoint, 90 deg off
+    mk('match', [[0, 104], [400, 96]]),                    // 4 px off, ~1 deg off
+  ];
+  const rk = C.rankTrails(trs, { ax: 100, ay: 100, bx: 300, by: 100 });
+  ok('the trail that lies along the streak ranks first', rk[0].id === 'match',
+    rk.map((r) => `${r.id} off ${r.offPx.toFixed(0)} d${r.dAng.toFixed(1)}`).join(' | '));
+  ok('its offset and angle are measured', rk[0].offPx < 5 && rk[0].dAng < 2);
+  ok('a perpendicular trail through the same point does not win', rk[rk.length - 1].id !== 'match' &&
+    rk.find((r) => r.id === 'crossing').dAng === 90);
+  const nr = C._nearestOnTrail(trs[2], 200, 150);
+  ok('nearest point on a trail carries its time', Math.abs(nr.d - 50) < 1 && Math.abs(nr.t - 500) < 5,
+    `d ${nr.d.toFixed(1)}, t ${nr.t.toFixed(0)}`);
+
+  // circular field outline: gnomonic, so R lands at tan(R)
+  ok('a 30 deg circular field is drawn at 33.1 tangent-degrees',
+    Math.abs(C.circTanDeg(30) - 33.0797) < 1e-3, C.circTanDeg(30).toFixed(4));
+  ok('a small field is unchanged to the arcsecond', Math.abs(C.circTanDeg(0.5) - 0.5) < 1.3e-5);
+}
+
+// ---------------------------------------------------------------- test 16
+console.log('\n[16] round 22 — names never overlap; hover, click, ruler and timeline act');
+{
+  const T0 = Date.parse('2026-07-21T22:00:00Z');
+  const LOC = { id: 'l1', name: 'Greenwich', latDeg: 51.4779, lonDeg: -0.0015, altM: 47, active: true };
+  // twelve trails fanned through one point: the worst case for label placement
+  const FAN = [];
+  for (let i = 0; i < 12; i++) {
+    const ang = i * 15 * Math.PI / 180, pts = [];
+    for (let k = 0; k <= 32; k++) {
+      const f = k / 32 - 0.5;
+      pts.push({ t: T0 + i * 4000 + (f + 0.5) * 3000,
+        raDeg: RA0 + 1.4 * f * Math.cos(ang) / Math.cos(DEC0 * Math.PI / 180), decDeg: DEC0 + 1.4 * f * Math.sin(ang) });
+    }
+    FAN.push({
+      satId: 'f_' + i, norad: 60000 + i, name: 'FAN-OBJECT-' + i, type: i % 3 === 0 ? 'DEB' : 'PAY', cls: 'leo',
+      tEnterMs: pts[0].t, tExitMs: pts[32].t, tCaMs: pts[16].t, rateAsPerS: 1500, paDeg: 90 - i * 15,
+      rateMountAsPerS: 1490, paMountDeg: 90 - i * 15, rangeKm: 700, shadow: i === 5 ? 'umbra' : 'none',
+      magEst: 5, tleAgeDays: 0.5, tleSlopDeg: 0.1, path: pts,
+    });
+  }
+  let clicked = 'unset', selected = 'unset', clockSet = null;
+  Object.assign(SAT.state.obs, {
+    mode: 'radec', track: 'sky', raDeg: RA0, decDeg: DEC0, fovShape: 'rect',
+    fovWDeg: 1.5, fovHDeg: 1.0, rotDeg: 0, flipEW: false,
+  });
+  SAT.state.activeLocation = () => LOC;
+  SAT.state.selection = { satId: null };
+  SAT.state.scan = { crossings: FAN, stale: false, ranAt: new Date(T0),
+    params: { t0Ms: T0, spanMin: 1, pointing: { track: 'sky' } } };
+  SAT.state.chartCrossings = () => FAN;
+  SAT.state.clickSelect = (id) => { clicked = id; };
+  SAT.state.setSelection = (id) => { selected = id; SAT.state.selection.satId = id; };
+  SAT.state.typeColorOf = (t) => (t === 'DEB' ? '#f06292' : '#ffd54f');
+  SAT.clock = { getDate: () => new Date(T0), setDate: (d) => { clockSet = d.getTime(); } };
+  Object.assign(SAT.state.settings.chart, {
+    stars: false, starNames: false, constLines: false, constNames: false, grid: true,
+    labels: true, tracks: true, ticks: true, legend: true, timeline: true, sunMoon: false,
+  });
+  const canvases = created.filter((e) => e.tag === 'canvas');
+  const cv = canvases[0], tcv = canvases[1];
+  ok('the chart and the timeline each have a canvas', canvases.length === 2);
+
+  const boxesOf = (list) => list.map((q) => {
+    const w = 6 * q.t.length;      // the stub's measureText; text is drawn centred
+    return [q.x - w / 2, q.y - 6, q.x + w / 2, q.y + 6, q.t];
+  });
+  const overlaps = (B) => {
+    const bad = [];
+    for (let i = 0; i < B.length; i++) for (let j = i + 1; j < B.length; j++) {
+      if (B[i][0] < B[j][2] && B[i][2] > B[j][0] && B[i][1] < B[j][3] && B[i][3] > B[j][1]) bad.push(B[i][4] + ' x ' + B[j][4]);
+    }
+    return bad;
+  };
+  texts.length = 0;
+  let dashes = calls.setLineDash || 0;
+  C.fitView();
+  // the canvas font is the only channel that tells chart text from timeline text
+  // here: timeline labels are HH:MM:SS, everything else is the chart's
+  const onChart = texts.filter((q) => !/^\d\d:\d\d(:\d\d)?$/.test(q.t));
+  const names = onChart.filter((q) => /^FAN-OBJECT-/.test(q.t));
+  const B = boxesOf(onChart);
+  ok('most of the twelve fanned trails get a name', names.length >= 8, `${names.length} of 12: ` + names.map((q) => q.t.slice(11, 13) + '@' + Math.round(q.x) + ',' + Math.round(q.y)).join(' '));
+  ok('no two pieces of chart text overlap', overlaps(B).length === 0, overlaps(B).slice(0, 3).join(' ; '));
+  ok('names sit outside the field frame, not on the image',
+    names.filter((q) => Math.abs(q.x - 450) < 300 && Math.abs(q.y - 350) < 180).length <= 2,
+    `${names.filter((q) => Math.abs(q.x - 450) < 300 && Math.abs(q.y - 350) < 180).length} inside`);
+  ok('the eclipsed trail is drawn dashed', (calls.setLineDash || 0) > dashes);
+  ok('the colour key names the types present', onChart.some((q) => /^payload 8$/.test(q.t)) &&
+    onChart.some((q) => /^debris 4$/.test(q.t)), onChart.filter((q) => /payload|debris/.test(q.t)).map((q) => q.t).join(', '));
+
+  // hover: a point on trail 0 (it runs horizontally through the field centre)
+  fire(cv, 'mousemove', { clientX: 300, clientY: 350 });
+  texts.length = 0;
+  C.requestRender();
+  ok('hovering a trail anywhere along it annotates it as a clock',
+    texts.some((q) => /^:\d\d\.\d$/.test(q.t)) && texts.some((q) => /^22:00:0\d\.\d$/.test(q.t)),
+    texts.filter((q) => /^:|^22:00:0/.test(q.t)).slice(0, 4).map((q) => q.t).join(' '));
+  fire(cv, 'mousedown', { clientX: 300, clientY: 350 });
+  fire(global, 'mouseup', {});
+  ok('clicking the trail — not its marker — selects that object', clicked === 'f_0', String(clicked));
+
+  // keys: R arms the ruler, a drag measures, Escape clears
+  fire(cv, 'keydown', { key: 'r' });
+  fire(cv, 'mousedown', { clientX: 200, clientY: 352 });
+  fire(global, 'mousemove', { clientX: 400, clientY: 352 });
+  fire(global, 'mouseup', {});
+  const rulerEl = created.find((e) => e.className === 'chart-ruler');
+  const rulerText = (rulerEl ? rulerEl.children : []).map((c) =>
+    (c.children || []).map((k) => (k && k.text) || (k && k.children || []).map((q) => q && q.text || '').join('')).join(' ')).join(' | ');
+  ok('dragging the ruler along a trail measures a streak and ranks that trail first',
+    !!rulerEl && rulerEl.style.display === 'block' && /streak/.test(rulerText) &&
+    rulerText.indexOf('FAN-OBJECT-0 [60000]') >= 0 &&
+    rulerText.indexOf('FAN-OBJECT-0 [60000]') < (rulerText.indexOf('FAN-OBJECT-1 ') + 1 || 1e9),
+    rulerText.slice(0, 150));
+  fire(cv, 'keydown', { key: 'Escape' });
+
+  // timeline: a press on empty time scrubs the clock into the scan window
+  fire(tcv, 'mousedown', { clientX: 455, clientY: 4 });
+  ok('pressing the timeline moves the clock inside the scan window',
+    clockSet != null && clockSet >= T0 && clockSet <= T0 + 60000,
+    clockSet == null ? 'clock not set' : `+${((clockSet - T0) / 1000).toFixed(1)} s`);
+  ok('half way along the strip is half way through the span',
+    clockSet != null && Math.abs(clockSet - (T0 + 30000)) < 1500);
+}
+
+// ---------------------------------------------------------------- test 17
+console.log('\n[17] round 23 — star layer: trails on a parked mount, hover readout, drawn depth');
+{
+  const T0 = Date.parse('2026-07-21T22:00:00Z');
+  const LOC = { id: 'l1', name: 'Greenwich', latDeg: 51.4779, lonDeg: -0.0015, altM: 47, active: true };
+  SAT.stars = {
+    isDeep: () => true, localLimit: () => 10.5,
+    cone: (ra, dec, r) => {
+      const out = [];
+      for (let k = 0; k < 300; k++) {
+        out.push({ raDeg: ra + (k % 20 - 9.5) * r / 14, decDeg: dec + (Math.floor(k / 20) - 7) * r / 14, mag: 2 + (k % 6) });
+      }
+      return out;
+    },
+    named: () => [], constellationLines: () => [],
+  };
+  SAT.state.activeLocation = () => LOC;
+  SAT.state.chartCrossings = () => [];
+  SAT.state.selection = { satId: null };
+  SAT.clock = { getDate: () => new Date(T0), setDate: () => {} };
+  Object.assign(SAT.state.settings.chart, {
+    stars: true, starTrails: true, magAuto: true, grid: false, legend: false, sunMoon: false,
+    constLines: false, starNames: false, constNames: false, timeline: true,
+  });
+  const strokes = () => calls.stroke || 0;
+  const render = (obs, scan) => {
+    Object.assign(SAT.state.obs, { mode: 'radec', track: 'sky', raDeg: RA0, decDeg: DEC0, azDeg: 180, elDeg: 55,
+      fovShape: 'rect', fovWDeg: 3, fovHDeg: 2, rotDeg: 0, flipEW: false, spanMin: 1 }, obs);
+    SAT.state.scan = scan;
+    SAT.bus.emitObs && SAT.bus.emitObs();
+    const s0 = strokes();
+    C.fitView();
+    return strokes() - s0;
+  };
+  const scan1 = { crossings: [], stale: false, ranAt: new Date(T0),
+    params: { t0Ms: T0, spanMin: 1, pointing: { track: 'mount', azDeg: 180, elDeg: 55 } } };
+
+  // star cone results are cached on the tangent point; nudge it between cases
+  const sky = render({ track: 'sky', raDeg: RA0 + 0.5 }, scan1);
+  const parkedOn = render({ mode: 'altaz', track: 'mount' }, scan1);
+  SAT.state.settings.chart.starTrails = false;
+  const parkedOff = render({ mode: 'altaz', track: 'mount', azDeg: 181 }, scan1);
+  SAT.state.settings.chart.starTrails = true;
+  ok('a parked mount draws a streak for every star over the exposure',
+    parkedOn - parkedOff >= 100, `${parkedOn} strokes with trails, ${parkedOff} without`);
+  ok('a sidereally tracked field draws none (stars are dots there)', sky < parkedOn - 100,
+    `${sky} strokes`);
+  const stale = render({ mode: 'altaz', track: 'mount', azDeg: 182 },
+    { crossings: [], stale: true, params: scan1.params });
+  ok('with no current scan the trails span clock .. clock + span', stale - parkedOff >= 100, `${stale} strokes`);
+
+  // hover readout
+  render({ track: 'sky', raDeg: RA0 + 1.0 }, scan1);
+  let found = null;
+  for (let y = 40; y < 660 && !found; y += 6) for (let x = 40; x < 860 && !found; x += 6) {
+    const h = C._starAt(x, y, 4);
+    if (h) found = { x: x, y: y, h: h };
+  }
+  ok('a drawn star can be picked by position', !!found && isFinite(found.h.mag),
+    found ? `V ${found.h.mag.toFixed(2)} at ${found.x},${found.y}` : 'none');
+  ok('and empty sky picks nothing', C._starAt(-500, -500, 7) === null);
+  const cur = created.find((e) => e.className === 'chart-cur');
+  const cvs = created.filter((e) => e.tag === 'canvas');
+  if (found && cur) {
+    fire(cvs[0], 'mousemove', { clientX: found.x, clientY: found.y });
+    ok('the status line shows the star\'s magnitude under the cursor',
+      /★ .*V \d+\.\d\d/.test(cur.textContent), cur.textContent);
+  }
+
+  // the Stars select says what "auto" resolved to
+  const opt = created.find((e) => e.tag === 'option' && /^auto/.test(e.textContent || '') ||
+    (e.tag === 'option' && e.children.some((c) => c && /^auto/.test(c.text || ''))));
+  ok('"auto" is labelled with the depth actually drawn',
+    !!opt && /^auto · V \d+\.\d$/.test(opt.textContent), opt ? opt.textContent : 'option not found');
 }
 
 console.log(failures ? `\n${failures} FAILURE(S)\n` : '\nall checks passed\n');

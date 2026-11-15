@@ -6,13 +6,20 @@
  *
  * The three stages, in order (CONTRACT.md "Algorithm"):
  *   1. static geometric cull, no SGP4 at all;
- *   2. coarse time sweep entirely in TEME, dot products only;
- *   3. fine refinement of the few surviving candidate windows, where converting to
- *      J2000 and doing real trigonometry is finally affordable.
+ *   2. coarse sweep in TEME, object by object, SKIPPING every stretch of time in
+ *      which the object provably cannot reach the field;
+ *   3. refinement of the surviving candidate windows by adaptive stepping against
+ *      the true field boundary — no fixed sampling grid, so a crossing shorter
+ *      than any "fine step" cannot fall between two samples.
  *
- * The thing that makes this interactive is not the language, it is that the POINTING
- * is rotated into TEME once per epoch and the 27 000 satellite vectors are left
- * alone. Only confirmed crossings are converted to J2000, at the end, for display.
+ * Stages 2 and 3 share one idea (round 22): the DISTANCE FROM THE SATELLITE TO
+ * THE SIGHTLINE, in kilometres, can only shrink as fast as things move. Divide the
+ * gap by the largest closing speed physics allows and you have a time during which
+ * the object cannot be in the field, whatever its orbit — see clearTime().
+ *
+ * The other thing that makes this interactive is that the POINTING is rotated
+ * into TEME once per epoch and the 33 000 satellite vectors are left alone. Only
+ * confirmed crossings are converted to J2000, at the end, for display.
  *
  * Structured so its core is callable from node: tools/test_scan.js drives loadObjs()
  * and runScan() directly, which is how the cull is proved sound (running with
@@ -34,8 +41,9 @@
    * behaviourally identical to it. If you change a formula, change frames.js first,
    * re-run its tests, then mirror it here.
    *
-   * Deliberately omitted (unused by the scan): moonJ2000, tanDeproject, topoTeme,
-   * sunJ2000, and siteTemeKm — the last replaced by obsStateAt() below, which is the
+   * Deliberately omitted (unused by the scan): moonJ2000, tanProject (field
+   * membership is three dot products since round 22 — see fieldSetup),
+   * tanDeproject, topoTeme, sunJ2000, and siteTemeKm — the last replaced by obsStateAt() below, which is the
    * same arithmetic with the site's constant ECEF vector hoisted out of a function
    * that stage 3 calls once per fine sample, and which is also where an ORBIT site
    * swaps in SGP4 (CONTRACT.md "Orbital observing stations").
@@ -316,19 +324,6 @@
     return { x: t.x * r, y: t.y * r, z: t.z * r };
   }
 
-  function tanProject(raDeg, decDeg, ra0, dec0) {
-    const d = decDeg * D2R, d0 = dec0 * D2R, dA = (raDeg - ra0) * D2R;
-    const sd = Math.sin(d), cd = Math.cos(d);
-    const sd0 = Math.sin(d0), cd0 = Math.cos(d0);
-    const cdA = Math.cos(dA), sdA = Math.sin(dA);
-    const cosc = sd0 * sd + cd0 * cd * cdA;
-    if (cosc <= 1e-12) return null;
-    return {
-      xi: (cd * sdA / cosc) * R2D,
-      eta: ((cd0 * sd - sd0 * cd * cdA) / cosc) * R2D,
-    };
-  }
-
   /* LVLH frame — mirrors frames.js lvlhBasis/lvlhToVec/vecToLvlh exactly.
    * R = zenith (radially out), W = orbit normal (r x v), S = along-track (W x R);
    * az from S toward W, el from the local-horizontal plane toward R. */
@@ -394,12 +389,38 @@
   const CULL_PAD_DEG = 1.0;
   const SLICE_MS = 40;            // work budget per chunk, so 'cancel' can be heard
 
-  // A GEO object sits inside a wide field for the whole scan, so a window can be the
-  // entire timespan and fineStepS = 1 s would mean 86 400 samples for ONE object on a
-  // 24 h scan. Cap the interior sampling and coarsen the step to fit; entry and exit
-  // are bisected to 50 ms afterwards regardless, so this costs nothing but the
-  // ability to resolve a brief exit-and-re-entry in the middle of a very long dwell.
-  const FINE_SAMPLE_CAP = 4000;
+  const C_KM_S = 299792.458;      // light time: the satellite is seen where it WAS
+
+  // ---- the clear-time bound (stages 2 and 3) -------------------------------
+  // PAD_ANG_DEG widens the field for the bound only: it absorbs the bucketed
+  // frame rotation below (<= 1e-3") and the precession of an "inertially fixed"
+  // pointing in TEME, with four orders of magnitude to spare. PAD_KM and LT_PAD
+  // absorb the light-time displacement stage 3 applies and stage 2 does not
+  // (v/c <= 3.7e-5, i.e. 37 m per 1000 km of range).
+  const PAD_ANG_DEG = 0.02;
+  const PAD_KM = 1.0;
+  const LT_PAD = 4e-5;
+  // Osculating perigee speed bounds the speed for the whole orbit; J2 wobbles it
+  // by ~0.15% in LEO. 3% + 50 m/s is a twenty-fold allowance.
+  const VMAX_PAD = 1.03, VMAX_PAD_KMS = 0.05;
+  const MAX_SKIP_S = 7200;        // re-examine every object at least this often
+
+  // ---- stage 3 adaptive stepping -------------------------------------------
+  // A step is SAFETY x (distance to the field edge) / (speed toward it), so the
+  // edge can only be overshot if the speed more than doubles inside one step —
+  // and RANGE_FRAC caps the step at the time the range could change by a quarter,
+  // which is what would have to happen for the angular speed to do that.
+  const SAFETY = 0.5;
+  const RANGE_FRAC = 0.25;
+  const CO_ORBIT_RATE = 1.25e-3;  // rad/s, a LEO mean motion: how fast a co-flying
+                                  // object's relative geometry can turn
+  const H_MIN_S = 0.01;           // never step finer than 10 ms
+  const H_MAX_S = 600;            // nor coarser than 10 min, however still the object
+  const EDGE_TOL_MS = 10;         // entry/exit bisection tolerance
+  const CA_TOL_MS = 5;            // closest-approach refinement tolerance
+  const MAX_PROBES = 200000;      // per window; a runaway guard, never reached in practice
+  const BUCKET_MS = 600000;       // TEME<->J2000 rotation re-derived every 10 min:
+                                  // precession+nutation move < 1e-3" in half of that
 
   /* ---- module state: the shard, built ONCE at 'load' ----------------------- */
 
@@ -584,7 +605,12 @@
     const spanMin = Math.max(0, p.spanMin || 0);
     const t0Ms = p.t0Ms;
     const t1Ms = t0Ms + spanMin * 60000;
-    const nSteps = Math.max(1, Math.round(spanMin * 60 / coarseStepS)) + 1;
+    // A UNIFORM grid that covers the span: the last step may overshoot t1 by less
+    // than one step, and the satellite, the observer and the pointing are all
+    // evaluated at that same instant. (Rounding the count and clamping only the
+    // observer's clock to t1, as rounds 1-21 did, propagated the satellite to one
+    // time and the observer to another on the final step.)
+    const nSteps = Math.max(1, Math.ceil(spanMin * 60 / coarseStepS - 1e-9)) + 1;
 
     // Ground: hoist the constant ECEF vector (stage 3 calls the provider once per
     // fine sample). Orbit: build the observer satrec ONCE, here. An invalid
@@ -606,6 +632,7 @@
         rObsMin: rad.rPeri, rObsMax: rad.rApo,
         nRadS: meanMotion(rec) / 60,
         slopKm: Math.min(TLE_ERR_KM_MAX, TLE_ERR_KM0 + TLE_ERR_KM_PER_DAY * ageDays),
+        tsince0: (jd0 - rec.jdsatepoch) * 1440,     // minutes since epoch at t0
       };
     } else {
       ecef = siteEcefKm(site);
@@ -633,6 +660,12 @@
       excludeNorad: obs ? obs.norad : null,
       useStage1: p.useStage1 !== false,
       maxCrossings: p.maxCrossings || 5000,
+      // clear-time bound: the field's circumscribing radius, padded. A field of
+      // 90 deg or more leaves no room outside it, the bound returns 0 and every
+      // step is examined — correct, just not accelerated.
+      sinR: Math.sin(Math.min(90, fovRadiusDeg + (steps.marginDeg || 0) + PAD_ANG_DEG) * D2R),
+      Vs: 0, OmP: 0, omObs: 0,        // filled by buildTables()
+      field: null,                    // filled by fieldSetup()
     };
   }
 
@@ -644,13 +677,27 @@
    *           stage 3's range-rate always needed and used to rebuild inline;
    *  orbit  — one sgp4() on the observer satrec. A failure THROWS and fails the
    *           whole scan: a scan quietly run from (0,0,0) is the worst bug here. */
-  function obsStateAt(P, date) {
+  function obsStateAt(P, date) { return obsStateMs(P, date.getTime()); }
+
+  /** obsStateAt on a millisecond clock, fractional milliseconds included.
+   *
+   *  The orbit branch forms the observer's time-since-epoch EXACTLY as every
+   *  target's is formed — an offset from the scan start, not a fresh Julian date.
+   *  A Julian date near 2.46 million days resolves only ~40 us, and a Date drops
+   *  the fraction of a millisecond; at 7.7 km/s those are 0.3 m and 7.7 m of
+   *  observer jitter. Harmless against a target a thousand kilometres away, but a
+   *  catalogue also holds objects that fly WITH the observer — the other ISS
+   *  modules carry the station's own elements — and for those the jitter was the
+   *  entire topocentric vector: a direction made of rounding noise, flickering
+   *  through the field a thousand times a minute. Formed identically, a
+   *  co-located object has range exactly zero and is never "in the field". */
+  function obsStateMs(P, tMs) {
     if (P.obsKind === 'orbit') {
-      const tsince = (date.getTime() / 86400000 + 2440587.5 - P.obs.epochJd) * 1440;
+      const tsince = P.obs.tsince0 + (tMs - P.t0Ms) / 60000;
       let pv = null;
       try { pv = satellite.sgp4(P.obs.rec, tsince); } catch (e) { pv = null; }
       if (!pv || !pv.position || pv.position === false || !isFinite(pv.position.x)) {
-        throw new Error('observer SGP4 failed at ' + date.toISOString() +
+        throw new Error('observer SGP4 failed at ' + new Date(tMs).toISOString() +
           ' (NORAD ' + P.obs.norad + ')');
       }
       return {
@@ -659,10 +706,317 @@
       };
     }
     const e = P.siteEcef;
-    const g = gmstRad(date, P.dut1S);
+    // gstime() of a numeric Julian date: identical to the Date path at integer
+    // milliseconds, and it does not truncate between them
+    const g = satellite.gstime(tMs / 86400000 + 2440587.5 + P.dut1S / 86400);
     const c = Math.cos(g), s = Math.sin(g);
     const x = e.x * c - e.y * s, y = e.x * s + e.y * c;
     return { x: x, y: y, z: e.z, vx: -OMEGA_E * y, vy: OMEGA_E * x, vz: 0 };
+  }
+
+  /* ---- the clear-time bound -------------------------------------------------
+   *
+   * THE QUESTION both stage 2 and stage 3 ask: the satellite is at range rho and
+   * D km from the sightline. How long before it could possibly be in the field?
+   *
+   * In the field means within angle R of the boresight, i.e. within rho*sin(R) km
+   * of the sightline ray. So the gap to close is  C = D - rho*sin(R).  It closes
+   * no faster than things move:
+   *
+   *   - the satellite, at most its perigee speed  V_sat  (from its osculating
+   *     state, padded);
+   *   - the ray's origin, at most the observer's speed  V_s;
+   *   - the ray's direction, turning at most  Om_p  rad/s, which sweeps the point
+   *     of the ray nearest the satellite at Om_p x (its range) — and that range is
+   *     at most rho + V_r*t, with  V_r = V_sat + V_s  the fastest the range grows.
+   *
+   * And rho*sin(R) itself grows no faster than V_r*sin(R). In-field is therefore
+   * impossible while
+   *
+   *   C  >  [V_r (1 + sin R) + Om_p rho] t  +  (Om_p V_r / 2) t^2 ,
+   *
+   * a quadratic whose positive root is the returned time. It holds BACKWARDS in
+   * time as well, by the same argument. Nothing here assumes a kind of orbit, a
+   * kind of observer or a kind of tracking: V_s and Om_p are measured off the
+   * per-step observer/pointing tables (buildTables), so a ground site, an orbit
+   * site, a sidereal field and an LVLH-fixed one are all the same code.
+   *
+   * Returns seconds; 0 when the object may already be in the field (or when its
+   * state is not a bound orbit and no speed limit can be vouched for).
+   */
+  function clearTime(P, rho, D, r, v) {
+    const C = D - rho * P.sinR - PAD_KM - rho * LT_PAD;
+    if (!(C > 0)) return 0;
+    const rr = Math.sqrt(r.x * r.x + r.y * r.y + r.z * r.z);
+    const eps = 0.5 * (v.x * v.x + v.y * v.y + v.z * v.z) - MU / rr;
+    if (!(eps < 0)) return 0;                       // not a bound orbit
+    const hx = r.y * v.z - r.z * v.y, hy = r.z * v.x - r.x * v.z, hz = r.x * v.y - r.y * v.x;
+    const h2 = hx * hx + hy * hy + hz * hz;
+    if (!(h2 > 0)) return 0;
+    const e2 = 1 + 2 * eps * h2 / (MU * MU);        // osculating eccentricity^2
+    const vPeri = MU * (1 + (e2 > 0 ? Math.sqrt(e2) : 0)) / Math.sqrt(h2);
+    const Vr = VMAX_PAD * vPeri + VMAX_PAD_KMS + P.Vs;
+    const A = Vr * (1 + P.sinR) + P.OmP * rho;
+    const b = 0.5 * P.OmP * Vr;
+    return 2 * C / (A + Math.sqrt(A * A + 4 * b * C));
+  }
+
+  /* ---- the detector frame, as vectors ---------------------------------------
+   *
+   * The field is a rectangle (or circle) on a tangent plane whose axes are the
+   * boresight b and the two detector axes ex, ey — rotDeg being the position
+   * angle of +Y from J2000 north. Membership is then three dot products,
+   *     X = (w.ex)/(w.b),  Y = (w.ey)/(w.b),
+   * with no RA/Dec and no trigonometry per sample. What differs between tracking
+   * modes is only WHICH FRAME those three vectors are constant in:
+   *
+   *   mode 0  track 'sky'            — fixed in J2000 (rotated to TEME per bucket)
+   *   mode 1  track 'mount', ground  — fixed to the Earth (a parked mount)
+   *   mode 2  track 'mount', orbit   — fixed in LVLH (a body-mounted sensor)
+   *
+   * For the two mount modes rotDeg is read AT THE SCAN START and the detector is
+   * then carried rigidly with the mount. On the ground that changes nothing — a
+   * fixed alt/az has a fixed hour angle and declination, so its parallactic angle
+   * is constant — but in LVLH the sky turns under the sensor once per orbit, and
+   * a rectangle held at a constant angle to celestial north (rounds 8-21) was not
+   * the rectangle a body-fixed detector sweeps.
+   */
+  function fieldSetup(P) {
+    const d0 = new Date(P.t0Ms);
+    const s0 = obsStateAt(P, d0);
+    const pt = pointingAt(P, d0, s0);
+    const a = pt.raDeg * D2R, d = pt.decDeg * D2R;
+    const sa = Math.sin(a), ca = Math.cos(a), sd = Math.sin(d), cd = Math.cos(d);
+    const bJ = { x: cd * ca, y: cd * sa, z: sd };
+    const eJ = { x: -sa, y: ca, z: 0 };                    // east
+    const nJ = { x: -sd * ca, y: -sd * sa, z: cd };        // north
+    const r = P.rotDeg * D2R, cr = Math.cos(r), sr = Math.sin(r);
+    // X = xi cos(rot) - eta sin(rot), Y = xi sin(rot) + eta cos(rot): a point at
+    // position angle rotDeg lands on +Y (frames.js tanProject, then the chart's rot)
+    const xJ = { x: eJ.x * cr - nJ.x * sr, y: eJ.y * cr - nJ.y * sr, z: eJ.z * cr - nJ.z * sr };
+    const yJ = { x: eJ.x * sr + nJ.x * cr, y: eJ.y * sr + nJ.y * cr, z: eJ.z * sr + nJ.z * cr };
+    const flat = (u, v, w) => new Float64Array([u.x, u.y, u.z, v.x, v.y, v.z, w.x, w.y, w.z]);
+    if (P.pointing.track !== 'mount') {
+      return { mode: 0, c: flat(bJ, xJ, yJ), teme: new Float64Array(9), bucket: NaN };
+    }
+    const bT = j2000ToTeme(bJ, d0), xT = j2000ToTeme(xJ, d0), yT = j2000ToTeme(yJ, d0);
+    if (P.obsKind === 'orbit') {
+      const B = lvlhBasis({ x: s0.x, y: s0.y, z: s0.z }, { x: s0.vx, y: s0.vy, z: s0.vz });
+      if (!B) throw new Error('degenerate observer state (r parallel to v) — cannot form LVLH');
+      const co = (u) => ({
+        x: u.x * B.S.x + u.y * B.S.y + u.z * B.S.z,
+        y: u.x * B.W.x + u.y * B.W.y + u.z * B.W.z,
+        z: u.x * B.R.x + u.y * B.R.y + u.z * B.R.z,
+      });
+      return { mode: 2, c: flat(co(bT), co(xT), co(yT)) };
+    }
+    const g = gmstRad(d0, P.dut1S), c = Math.cos(g), sn = Math.sin(g);
+    const toE = (u) => ({ x: u.x * c + u.y * sn, y: -u.x * sn + u.y * c, z: u.z });
+    return { mode: 1, c: flat(toE(bT), toE(xT), toE(yT)) };
+  }
+
+  /** J2000 -> TEME as a 3x3 (row-major), re-derived once per BUCKET_MS. The search
+   *  samples of stage 3 use this instead of running the 20-term nutation series
+   *  per sample; everything REPORTED still goes through the exact functions. */
+  let rotBucket = NaN;
+  const ROT = new Float64Array(9);
+  function rotJ2T(tMs) {
+    const bk = Math.floor(tMs / BUCKET_MS);
+    if (bk !== rotBucket) {
+      const dt = new Date((bk + 0.5) * BUCKET_MS);
+      const ex = j2000ToTeme({ x: 1, y: 0, z: 0 }, dt);
+      const ey = j2000ToTeme({ x: 0, y: 1, z: 0 }, dt);
+      const ez = j2000ToTeme({ x: 0, y: 0, z: 1 }, dt);
+      ROT[0] = ex.x; ROT[1] = ey.x; ROT[2] = ez.x;
+      ROT[3] = ex.y; ROT[4] = ey.y; ROT[5] = ez.y;
+      ROT[6] = ex.z; ROT[7] = ey.z; ROT[8] = ez.z;
+      rotBucket = bk;
+    }
+    return ROT;
+  }
+
+  /** One fast sample: where the object is relative to the field at tMs, and how
+   *  long it is safe to step before looking again.
+   *
+   *  Returns { t, ok, in, sep, h }:
+   *    in  — inside the true field boundary AND visible (above the horizon / the
+   *          minimum elevation on the ground; clear of the Earth's limb in orbit);
+   *    sep — angle from the boresight, degrees (closest approach minimises this);
+   *    h   — seconds until the membership could change (see SAFETY / RANGE_FRAC),
+   *          or, while the object is well outside, the rigorous clearTime().
+   *  With `sky` set it also returns the J2000 raDeg/decDeg, for the path samples.
+   */
+  function probe(P, rec, tsince0Min, tMs, sky) {
+    let pv;
+    try { pv = satellite.sgp4(rec, tsince0Min + (tMs - P.t0Ms) / 60000); } catch (e) { pv = null; }
+    if (!pv || !pv.position || pv.position === false || !pv.velocity) {
+      return { t: tMs, ok: false, in: false, sep: 999, h: P.fineStepS };
+    }
+    const r = pv.position, v = pv.velocity;
+
+    // observer state; the ground branch keeps cos/sin(GMST) for the field frame
+    let sx, sy, sz, svx, svy, svz, gc = 1, gs = 0;
+    if (P.obsKind === 'orbit') {
+      const st = obsStateMs(P, tMs);
+      sx = st.x; sy = st.y; sz = st.z; svx = st.vx; svy = st.vy; svz = st.vz;
+    } else {
+      const g = satellite.gstime(tMs / 86400000 + 2440587.5 + P.dut1S / 86400);
+      gc = Math.cos(g); gs = Math.sin(g);
+      const e = P.siteEcef;
+      sx = e.x * gc - e.y * gs; sy = e.x * gs + e.y * gc; sz = e.z;
+      svx = -OMEGA_E * sy; svy = OMEGA_E * sx; svz = 0;
+    }
+
+    // topocentric vector, light-time corrected to first order: the photon left
+    // rho/c ago, when the satellite was v*rho/c further back along its track
+    let wx = r.x - sx, wy = r.y - sy, wz = r.z - sz;
+    let rho = Math.sqrt(wx * wx + wy * wy + wz * wz);
+    const tau = rho / C_KM_S;
+    wx -= v.x * tau; wy -= v.y * tau; wz -= v.z * tau;
+    rho = Math.sqrt(wx * wx + wy * wy + wz * wz);
+    // exactly co-located with the observer: no direction exists, and it will not
+    // acquire one — look again in ten minutes rather than every 10 ms
+    if (!(rho > 0)) return { t: tMs, ok: false, in: false, sep: 999, h: H_MAX_S };
+
+    // detector frame in TEME at this instant, and its rotation rate (Ox,Oy,Oz)
+    const F = P.field, c = F.c;
+    let bx, by, bz, exx, exy, exz, eyx, eyy, eyz, Ox = 0, Oy = 0, Oz = 0;
+    const sR2 = sx * sx + sy * sy + sz * sz, sR = Math.sqrt(sR2);
+    if (F.mode === 0) {
+      const bk = Math.floor(tMs / BUCKET_MS);
+      const T = F.teme;
+      if (bk !== F.bucket) {
+        const M = rotJ2T(tMs);
+        for (let i = 0; i < 9; i += 3) {
+          T[i] = M[0] * c[i] + M[1] * c[i + 1] + M[2] * c[i + 2];
+          T[i + 1] = M[3] * c[i] + M[4] * c[i + 1] + M[5] * c[i + 2];
+          T[i + 2] = M[6] * c[i] + M[7] * c[i + 1] + M[8] * c[i + 2];
+        }
+        F.bucket = bk;
+      }
+      bx = T[0]; by = T[1]; bz = T[2];
+      exx = T[3]; exy = T[4]; exz = T[5];
+      eyx = T[6]; eyy = T[7]; eyz = T[8];
+    } else if (F.mode === 1) {
+      bx = c[0] * gc - c[1] * gs; by = c[0] * gs + c[1] * gc; bz = c[2];
+      exx = c[3] * gc - c[4] * gs; exy = c[3] * gs + c[4] * gc; exz = c[5];
+      eyx = c[6] * gc - c[7] * gs; eyy = c[6] * gs + c[7] * gc; eyz = c[8];
+      Oz = OMEGA_E;
+    } else {
+      // LVLH basis from the observer state: R zenith, W orbit normal, S along-track
+      const Rx = sx / sR, Ry = sy / sR, Rz = sz / sR;
+      let Wx = sy * svz - sz * svy, Wy = sz * svx - sx * svz, Wz = sx * svy - sy * svx;
+      const wn = Math.sqrt(Wx * Wx + Wy * Wy + Wz * Wz);
+      Ox = Wx / sR2; Oy = Wy / sR2; Oz = Wz / sR2;         // Omega_LVLH = (r x v)/|r|^2
+      Wx /= wn; Wy /= wn; Wz /= wn;
+      const Sx = Wy * Rz - Wz * Ry, Sy = Wz * Rx - Wx * Rz, Sz = Wx * Ry - Wy * Rx;
+      bx = c[0] * Sx + c[1] * Wx + c[2] * Rx; by = c[0] * Sy + c[1] * Wy + c[2] * Ry;
+      bz = c[0] * Sz + c[1] * Wz + c[2] * Rz;
+      exx = c[3] * Sx + c[4] * Wx + c[5] * Rx; exy = c[3] * Sy + c[4] * Wy + c[5] * Ry;
+      exz = c[3] * Sz + c[4] * Wz + c[5] * Rz;
+      eyx = c[6] * Sx + c[7] * Wx + c[8] * Rx; eyy = c[6] * Sy + c[7] * Wy + c[8] * Ry;
+      eyz = c[6] * Sz + c[7] * Wz + c[8] * Rz;
+    }
+
+    const zc = wx * bx + wy * by + wz * bz;                // along the boresight
+    const D = zc > 0 ? Math.sqrt(Math.max(0, rho * rho - zc * zc)) : rho;
+    const dtRig = clearTime(P, rho, D, r, v);
+
+    // relative velocity, inertial, and the inertial angular speed of the direction
+    const ux = v.x - svx, uy = v.y - svy, uz = v.z - svz;
+    const radial = (ux * wx + uy * wy + uz * wz) / rho;
+    const wDir = Math.sqrt(Math.max(0, ux * ux + uy * uy + uz * uz - radial * radial)) / rho;
+
+    // ---- visibility: gV <= 0 visible, > 0 hidden by that many degrees ----------
+    const up = wx * sx + wy * sy + wz * sz;
+    let gV, sV;
+    if (P.obsKind === 'orbit') {
+      // Earth-limb occlusion (CONTRACT v0.2 gate 1): hidden iff the target lies
+      // beyond the line of sight's closest point to the Earth's centre AND that
+      // point is inside the hard sphere. In angles: nadir distance < limb angle.
+      const tStar = -up / rho;
+      if (tStar > 0 && tStar < rho) {
+        gV = (Math.asin(Math.min(1, RE_EQ / sR))
+          - Math.asin(Math.min(1, Math.sqrt(Math.max(0, sR2 - tStar * tStar)) / sR))) * R2D;
+      } else gV = -90;
+      sV = (wDir + P.omObs) * R2D;
+    } else {
+      // The site vector IS the local up (geocentric), as in rounds 1-21. A ground
+      // target is in the field only while above the horizon — or minElDeg.
+      gV = P.minElDeg - Math.asin(Math.max(-1, Math.min(1, up / (rho * sR)))) * R2D;
+      sV = (wDir + OMEGA_E) * R2D;
+    }
+
+    // ---- field: gF <= 0 inside, > 0 outside by that many (tangent-plane) degrees
+    let gF, sF = 0, sep, tx = 0, ty = 0;
+    const cosSep = Math.max(-1, Math.min(1, zc / rho));
+    if (zc > 1e-9 * rho) {
+      tx = (wx * exx + wy * exy + wz * exz) / zc;
+      ty = (wx * eyx + wy * eyy + wz * eyz) / zc;
+      const tr2 = tx * tx + ty * ty;
+      sep = Math.atan(Math.sqrt(tr2)) * R2D;
+      // velocity as the DETECTOR sees it: relative velocity minus the frame's turning
+      const fx = ux - (Oy * wz - Oz * wy), fy = uy - (Oz * wx - Ox * wz), fz = uz - (Ox * wy - Oy * wx);
+      const dz = fx * bx + fy * by + fz * bz;
+      const dX = ((fx * exx + fy * exy + fz * exz) - tx * dz) / zc;
+      const dY = ((fx * eyx + fy * eyy + fz * eyz) - ty * dz) / zc;
+      const sp = Math.sqrt(dX * dX + dY * dY) * R2D;       // tangent-plane deg/s
+      if (P.shape === 'circ') {
+        gF = sep - P.fovRadiusDeg;
+        sF = sp / (1 + tr2);                               // d(sep)/dt <= that
+      } else {
+        const qx = Math.abs(tx) * R2D - P.halfW, qy = Math.abs(ty) * R2D - P.halfH;
+        gF = (qx > 0 || qy > 0)
+          ? Math.sqrt((qx > 0 ? qx * qx : 0) + (qy > 0 ? qy * qy : 0))
+          : Math.max(qx, qy);
+        sF = sp;
+      }
+    } else {
+      sep = Math.acos(cosSep) * R2D;
+      gF = 1e9;
+    }
+
+    const inF = gF <= 0 && gV <= 0;
+    // RANGE_FRAC cap: the time in which the viewing geometry can change by a
+    // quarter — the range at the relative speed, or, for an object flying WITH
+    // the observer (relative speed ~0), the relative orbit at the orbital rate.
+    const cap = RANGE_FRAC / (Math.sqrt(ux * ux + uy * uy + uz * uz) / rho + CO_ORBIT_RATE);
+    const hF = SAFETY * Math.abs(gF) / Math.max(sF, 1e-12);
+    const hV = SAFETY * Math.abs(gV) / Math.max(sV, 1e-12);
+    let h;
+    if (inF) {
+      h = Math.min(hF, hV, cap);
+    } else {
+      let hf = 0;
+      if (gF > 0) {
+        // near the field the tangent-plane distance is trusted; further out only
+        // the angle to the circumscribing circle — and always at least the
+        // rigorous clear time, which is the only thing trusted far away
+        let heur = 0;
+        if (zc > 0 && sep < 60) heur = hF;
+        else {
+          const gA = sep - P.fovRadiusDeg;
+          if (gA > 0) heur = SAFETY * gA / Math.max((wDir + P.OmP) * R2D, 1e-12);
+        }
+        hf = Math.max(dtRig, Math.min(cap, heur));
+      }
+      h = Math.max(hf, gV > 0 ? Math.min(hV, cap) : 0);
+    }
+    if (!(h > H_MIN_S)) h = H_MIN_S; else if (h > H_MAX_S) h = H_MAX_S;
+
+    const out = { t: tMs, ok: true, in: inF, sep: sep, h: h };
+    if (sky) {
+      // TEME -> J2000 is the transpose of the bucketed J2000 -> TEME rotation
+      const M = rotJ2T(tMs);
+      const jx = M[0] * wx + M[3] * wy + M[6] * wz;
+      const jy = M[1] * wx + M[4] * wy + M[7] * wz;
+      const jz = M[2] * wx + M[5] * wy + M[8] * wz;
+      let ra = Math.atan2(jy, jx) * R2D;
+      if (ra < 0) ra += 360;
+      out.raDeg = ra;
+      out.decDeg = Math.asin(Math.max(-1, Math.min(1, jz / rho))) * R2D;
+    }
+    return out;
   }
 
   /** Pointing at one epoch: the TEME unit vector the hot loop compares against,
@@ -856,18 +1210,70 @@
     return keep;
   }
 
+  /** Per-step observer and pointing tables for stage 2, plus the three speed
+   *  limits the clear-time bound needs, MEASURED off those same tables:
+   *    P.Vs    — fastest the observer moves (km/s);
+   *    P.OmP   — fastest the boresight turns in TEME (rad/s): ~0 for a sidereal
+   *              field, the Earth's rate for a parked mount, the orbital rate for
+   *              an LVLH-fixed sensor;
+   *    P.omObs — fastest the nadir direction turns (orbit sites; limb test).
+   *  One observer state and one pointing per step, outside every satellite loop
+   *  (CONTRACT rule 4). An unpropagatable observer throws here and fails the scan
+   *  loudly — see obsStateAt. */
+  function buildTables(P) {
+    const n = P.nSteps, stepMs = P.coarseStepS * 1000;
+    const tabS = new Float64Array(n * 3), tabP = new Float64Array(n * 3);
+    let Vs = 0, OmP = 0, omObs = 0;
+    for (let k = 0; k < n; k++) {
+      const date = new Date(P.t0Ms + k * stepMs);
+      const st = obsStateAt(P, date);
+      const pt = pointingAt(P, date, st);
+      const pn = Math.sqrt(pt.x * pt.x + pt.y * pt.y + pt.z * pt.z) || 1;
+      const o = k * 3;
+      tabS[o] = st.x; tabS[o + 1] = st.y; tabS[o + 2] = st.z;
+      tabP[o] = pt.x / pn; tabP[o + 1] = pt.y / pn; tabP[o + 2] = pt.z / pn;
+      Vs = Math.max(Vs, Math.sqrt(st.vx * st.vx + st.vy * st.vy + st.vz * st.vz));
+      const s2 = st.x * st.x + st.y * st.y + st.z * st.z;
+      const hx = st.y * st.vz - st.z * st.vy, hy = st.z * st.vx - st.x * st.vz,
+        hz = st.x * st.vy - st.y * st.vx;
+      omObs = Math.max(omObs, Math.sqrt(hx * hx + hy * hy + hz * hz) / s2);
+      if (k > 0) {
+        const ax = tabP[o - 3], ay = tabP[o - 2], az = tabP[o - 1];
+        const bx = tabP[o], by = tabP[o + 1], bz = tabP[o + 2];
+        const cx = ay * bz - az * by, cy = az * bx - ax * bz, cz = ax * by - ay * bx;
+        const ang = Math.atan2(Math.sqrt(cx * cx + cy * cy + cz * cz), ax * bx + ay * by + az * bz);
+        OmP = Math.max(OmP, ang / P.coarseStepS);
+      }
+    }
+    // chord-vs-arc and between-sample maxima: a few percent is far more than either
+    P.Vs = Vs * 1.02 + 1e-3;
+    P.OmP = OmP * 1.05 + 1e-12;
+    P.omObs = omObs * 1.05;
+    return { tabS: tabS, tabP: tabP };
+  }
+
   /** The whole scan. Chunked with setTimeout so a 'cancel' message can land and so
    *  progress is reported; resolves with crossings plus the per-stage cull counts. */
   function runScan(params, onProgress) {
     const P = prepare(params);
     cancelled = false;
     const t0Wall = Date.now();
+    const now = (typeof performance !== 'undefined' && performance.now)
+      ? () => performance.now() : () => Date.now();
+    // the detector frame and the step tables both need the observer, so an
+    // unusable observer fails here, synchronously, before any work is queued
+    P.field = fieldSetup(P);
+    const tT = now();
+    const tabs = buildTables(P);
+    const tabS = tabs.tabS, tabP = tabs.tabP;
 
     return new Promise((resolve, reject) => {
       const n = recs.length;
       let propagations = 0;
+      const timing = { stage1Ms: 0, stage2Ms: now() - tT, stage3Ms: 0 };
 
       // ---- stage 1 -------------------------------------------------------
+      let tS = now();
       const keep = P.useStage1 ? stage1(P) : (() => {
         const k = new Uint8Array(n);
         for (let i = 0; i < n; i++) if (recs[i]) k[i] = 1;
@@ -883,6 +1289,7 @@
         live.push(i);
       }
       const culledStage1 = n - badCount - live.length;
+      timing.stage1Ms = now() - tS;
 
       // Per-survivor constants, hoisted out of the step loop.
       const nLive = live.length;
@@ -891,173 +1298,94 @@
       const ageDays = new Float64Array(nLive);
       const jd0 = P.t0Ms / 86400000 + 2440587.5;
       for (let k = 0; k < nLive; k++) {
-        const rec = recs[live[k]];
         tsince0[k] = (jd0 - epochJd[live[k]]) * 1440;
         const age = Math.abs(tsince0[k]) / 1440;
         ageDays[k] = age;
         slopKm[k] = Math.min(TLE_ERR_KM_MAX, TLE_ERR_KM0 + TLE_ERR_KM_PER_DAY * age);
       }
 
-      // ---- stage 2 state -------------------------------------------------
-      const stepMin = P.coarseStepS / 60;
-      const stepMs = P.coarseStepS * 1000;
-      const prevU = new Float64Array(nLive * 3);
-      const hasPrev = new Uint8Array(nLive);
-      const winA = new Float64Array(nLive);      // open candidate window, ms
-      const winB = new Float64Array(nLive);
-      const winOpen = new Uint8Array(nLive);
-      const windows = new Map();                 // live index -> [[a,b], ...]
-      const extraMarginRad = P.marginDeg * D2R;
-
-      const openWindow = (k, tMs) => {
-        const a = tMs - stepMs, b = tMs + stepMs;
-        if (winOpen[k] && a <= winB[k]) { winB[k] = Math.max(winB[k], b); return; }
-        if (winOpen[k]) {
-          let arr = windows.get(k);
-          if (!arr) { arr = []; windows.set(k, arr); }
-          arr.push([winA[k], winB[k]]);
-        }
-        winA[k] = a; winB[k] = b; winOpen[k] = 1;
-      };
-
-      let step = 0;
+      // ---- stage 2: coarse sweep with skipping ---------------------------
+      // Object by object, so one satrec stays hot and each object keeps its own
+      // clock. At a step, clearTime() says how long the object provably cannot
+      // be in the field:
+      //   >= one step  -> jump that many whole steps (the bound holds for all of
+      //                   them, and for the step just behind as well);
+      //   <  one step  -> the object may be in the field within one step either
+      //                   side: open the window [t - step, t + step].
+      // A LEO object on the far side of the Earth is ~13 000 km from the
+      // sightline and closes at <= ~8.5 km/s, so it is not looked at again for
+      // 25 minutes; a typical orbit costs a dozen propagations instead of 190.
+      // There is no horizon test here and no angular margin: an object below the
+      // horizon is simply far from a sightline that points above it, and
+      // visibility is imposed exactly, per sample, in stage 3.
+      const nSteps = P.nSteps;
+      const stepS = P.coarseStepS, stepMin = stepS / 60, stepMs = stepS * 1000;
+      const maxSkip = Math.max(1, Math.floor(MAX_SKIP_S / stepS));
+      const cands = [];                          // [{k, wins: [[a,b], ...]}]
+      let ki = 0;
 
       const coarseChunk = () => {
         if (cancelled) { reject(new Error('cancelled')); return; }
+        const tC = now();
         const deadline = Date.now() + SLICE_MS;
-        try {
-        while (step < P.nSteps && Date.now() < deadline) {
-          const tMs = Math.min(P.t0Ms + step * stepMs, P.t1Ms);
-          const date = new Date(tMs);
-
-          // ---- once per epoch, outside the satellite loop (CONTRACT rule 4) ----
-          const s = obsStateAt(P, date);
-          const sx = s.x, sy = s.y, sz = s.z;
-          const svx = s.vx, svy = s.vy, svz = s.vz;        // observer velocity, TEME
-          const S2 = sx * sx + sy * sy + sz * sz;          // |s|^2, for the limb test
-          const isOrbit = P.obsKind === 'orbit';
-          const pt = pointingAt(P, date, s);
-          const pn = Math.sqrt(pt.x * pt.x + pt.y * pt.y + pt.z * pt.z) || 1;
-          const px = pt.x / pn, py = pt.y / pn, pz = pt.z / pn;
-          const tsinceStep = step * stepMin;
-
-          for (let k = 0; k < nLive; k++) {
-            const rec = recs[live[k]];
+        let tick = 0;
+        while (ki < nLive && ((++tick & 15) !== 0 || Date.now() < deadline)) {
+          const rec = recs[live[ki]];
+          const ts0 = tsince0[ki];
+          let wins = null, wA = 0, wB = 0, open = false;
+          let k = 0;
+          while (k < nSteps) {
             let pv;
-            try { pv = satellite.sgp4(rec, tsince0[k] + tsinceStep); }
-            catch (e) { pv = null; }
+            try { pv = satellite.sgp4(rec, ts0 + k * stepMin); } catch (e) { pv = null; }
             propagations++;
-            if (!pv || !pv.position || pv.position === false) { hasPrev[k] = 0; continue; }
-            const r = pv.position;
-
-            const dx = r.x - sx, dy = r.y - sy, dz = r.z - sz;
-            const r2 = dx * dx + dy * dy + dz * dz;
-
-            let rho;
-            if (isOrbit) {
-              // Earth-limb occlusion (CONTRACT v0.2 gate 1): drop the sample iff
-              // the observer->target segment dips inside the hard Earth sphere.
-              rho = Math.sqrt(r2);
-              const tStar = -(sx * dx + sy * dy + sz * dz) / rho;
-              if (tStar > 0 && tStar < rho && S2 - tStar * tStar < RE_EQ * RE_EQ) {
-                hasPrev[k] = 0; continue;
-              }
-            } else {
-              // horizon: dot(topo, site) > 0 — the site vector IS the local up
-              const up = dx * sx + dy * sy + dz * sz;
-              if (up <= 0) { hasPrev[k] = 0; continue; }
-              rho = Math.sqrt(r2);
-              if (P.sinMinEl > 0 && up < P.sinMinEl * rho * P.siteR) { hasPrev[k] = 0; continue; }
+            if (!pv || !pv.position || pv.position === false || !pv.velocity) { k++; continue; }
+            const r = pv.position, o = k * 3;
+            const dx = r.x - tabS[o], dy = r.y - tabS[o + 1], dz = r.z - tabS[o + 2];
+            const rho2 = dx * dx + dy * dy + dz * dz;
+            const proj = dx * tabP[o] + dy * tabP[o + 1] + dz * tabP[o + 2];
+            const rho = Math.sqrt(rho2);
+            // distance to the sightline RAY: behind the observer it is the range
+            const D = proj > 0 ? Math.sqrt(Math.max(0, rho2 - proj * proj)) : rho;
+            const clear = clearTime(P, rho, D, r, pv.velocity);
+            if (clear >= stepS) {
+              k += Math.min(maxSkip, Math.floor(clear / stepS));
+              continue;
             }
-
-            // adaptive margin, recomputed from THIS step's own range and speed:
-            // a GEO object gets arcminutes, an overhead LEO object tens of degrees.
-            // The slop charges BOTH element sets — at the sensor the observer's
-            // ephemeris error is indistinguishable from the target's.
-            const vx = pv.velocity.x - svx, vy = pv.velocity.y - svy, vz = pv.velocity.z - svz;
-            const omega = Math.sqrt(vx * vx + vy * vy + vz * vz) / rho;   // rad/s, upper bound
-            const slopRad = Math.min(TLE_SLOP_MAX_RAD, (slopKm[k] + P.obsSlopKm) / rho);
-            const m = P.fovRadiusRad + extraMarginRad + slopRad + omega * P.coarseStepS;
-
-            const ux = dx / rho, uy = dy / rho, uz = dz / rho;
-            const d = ux * px + uy * py + uz * pz;
-
-            // separation as a dot product against cos(margin) — no acos, no atan2.
-            // cos(m) >= 1 - m^2/2 always, so using the polynomial as the threshold
-            // accepts slightly MORE than the exact test: conservative by construction,
-            // and it keeps trig out of a loop that runs 27 000 x N times.
-            let hit = false;
-            if (m >= Math.PI) hit = true;
-            else hit = d >= Math.max(-1, 1 - m * m / 2);
-
-            // Great-circle arc between consecutive coarse positions. Tighter and
-            // cheaper to satisfy than a point test with a padded radius, so it is
-            // what lets coarseStepS stay large: an object that crosses the field
-            // entirely between two samples still shows up, because the chord passes
-            // through it even though neither endpoint is close.
-            if (!hit && hasPrev[k]) {
-              const o = k * 3;
-              const ax = prevU[o], ay = prevU[o + 1], az = prevU[o + 2];
-              const cx = ay * uz - az * uy, cy = az * ux - ax * uz, cz = ax * uy - ay * ux;
-              const nn = cx * cx + cy * cy + cz * cz;
-              if (nn > 1e-18) {
-                const pd = px * cx + py * cy + pz * cz;
-                const sm = Math.min(1, P.fovRadiusRad + extraMarginRad + slopRad);
-                if (pd * pd <= sm * sm * nn) {
-                  // is the closest point of the great circle between the two samples?
-                  const c0 = (ay * pz - az * py) * cx + (az * px - ax * pz) * cy
-                    + (ax * py - ay * px) * cz;
-                  const c1 = (py * uz - pz * uy) * cx + (pz * ux - px * uz) * cy
-                    + (px * uy - py * ux) * cz;
-                  if (c0 >= 0 && c1 >= 0) hit = true;
-                }
-              }
+            const tMs = P.t0Ms + k * stepMs;
+            const a = tMs - stepMs, b = tMs + stepMs;
+            if (open && a <= wB) wB = b;
+            else {
+              if (open) (wins || (wins = [])).push([wA, wB]);
+              wA = a; wB = b; open = true;
             }
-
-            const o = k * 3;
-            prevU[o] = ux; prevU[o + 1] = uy; prevU[o + 2] = uz;
-            hasPrev[k] = 1;
-
-            if (hit) openWindow(k, tMs);
+            k++;
           }
-          step++;
+          if (open) (wins || (wins = [])).push([wA, wB]);
+          if (wins) cands.push({ k: ki, wins: wins });
+          ki++;
         }
-        // an unpropagatable OBSERVER fails the scan loudly (see obsStateAt)
-        } catch (err) { reject(err); return; }
-
-        if (onProgress) onProgress({ done: step, total: P.nSteps, phase: 'coarse' });
-        if (step < P.nSteps) { setTimeout(coarseChunk, 0); return; }
-
-        for (let k = 0; k < nLive; k++) {
-          if (!winOpen[k]) continue;
-          let arr = windows.get(k);
-          if (!arr) { arr = []; windows.set(k, arr); }
-          arr.push([winA[k], winB[k]]);
-        }
-        setTimeout(fineStart, 0);
+        timing.stage2Ms += now() - tC;
+        if (onProgress) onProgress({ done: ki, total: nLive, phase: 'coarse' });
+        setTimeout(ki < nLive ? coarseChunk : fineChunk, 0);
       };
 
       // ---- stage 3 -------------------------------------------------------
-      const cands = [];
       const crossings = [];
       let ci = 0;
       let culledStage3 = 0;
 
-      const fineStart = () => {
-        windows.forEach((arr, k) => cands.push({ k: k, wins: arr }));
-        fineChunk();
-      };
-
       const fineChunk = () => {
         if (cancelled) { reject(new Error('cancelled')); return; }
+        const tF = now();
         const deadline = Date.now() + SLICE_MS;
         while (ci < cands.length && Date.now() < deadline) {
           const c = cands[ci++];
           const before = crossings.length;
-          try { refine(P, c.k, live[c.k], tsince0[c.k], ageDays[c.k], slopKm[c.k], c.wins, crossings); }
+          try { refine(P, live[c.k], tsince0[c.k], ageDays[c.k], slopKm[c.k], c.wins, crossings); }
           catch (e) { /* defensive: never let one bad object kill a scan */ }
           if (crossings.length === before) culledStage3++;
         }
+        timing.stage3Ms += now() - tF;
         if (onProgress) onProgress({ done: ci, total: cands.length, phase: 'fine' });
         if (ci < cands.length) { setTimeout(fineChunk, 0); return; }
 
@@ -1072,6 +1400,10 @@
             survivors: live.length, candidates: cands.length,
           },
           propagations: propagations,
+          // what a fixed-step sweep of the same survivors would have cost — the
+          // skip factor is the ratio, and the UI may as well be able to say so
+          gridPropagations: live.length * nSteps,
+          timing: timing,
           ms: Date.now() - t0Wall,
         });
       };
@@ -1080,10 +1412,12 @@
     });
   }
 
-  /** Full topocentric solution at one instant, in the frames the boundary test
-   *  needs. This is stage-3-only work: it converts to J2000 and uses real trig,
-   *  which would be ruinous in the coarse loop but costs nothing on a handful of
-   *  candidates. */
+  /** Full topocentric solution at one instant, through the EXACT frame functions.
+   *  Used only for what is reported — the closest-approach row of each confirmed
+   *  crossing — so it can afford the full nutation series; the search samples go
+   *  through probe(). The direction is the ASTROMETRIC one: light-time corrected
+   *  (the satellite as it was rho/c ago), no aberration — the place a plate
+   *  solution against catalogue stars measures. */
   function solveAt(P, rec, tsinceMin, tMs) {
     const date = new Date(tMs);
     let pv;
@@ -1092,21 +1426,14 @@
 
     const s = obsStateAt(P, date);
     const topo = { x: pv.position.x - s.x, y: pv.position.y - s.y, z: pv.position.z - s.z };
-    const rho = Math.sqrt(topo.x * topo.x + topo.y * topo.y + topo.z * topo.z);
+    let rho = Math.sqrt(topo.x * topo.x + topo.y * topo.y + topo.z * topo.z);
+    const tau = rho / C_KM_S;
+    topo.x -= pv.velocity.x * tau; topo.y -= pv.velocity.y * tau; topo.z -= pv.velocity.z * tau;
+    rho = Math.sqrt(topo.x * topo.x + topo.y * topo.y + topo.z * topo.z);
     const j = temeToJ2000(topo, date);
     const rd = vecToRaDec(j);
     const pt = pointingAt(P, date, s);
-
-    // upDot/(rho*|s|) is sin(height above the local horizontal) for EITHER kind —
-    // the ground zenith and the LVLH R axis are both just s_hat.
     const sR = Math.sqrt(s.x * s.x + s.y * s.y + s.z * s.z);
-    const upDot = topo.x * s.x + topo.y * s.y + topo.z * s.z;
-    const elSin = upDot / (rho * sR);
-    let occluded = false;
-    if (P.obsKind === 'orbit') {
-      const tStar = -upDot / rho;
-      occluded = tStar > 0 && tStar < rho && sR * sR - tStar * tStar < RE_EQ * RE_EQ;
-    }
 
     return {
       date: date, tMs: tMs, satTeme: pv.position, velTeme: pv.velocity,
@@ -1114,50 +1441,194 @@
       siteVel: { x: s.vx, y: s.vy, z: s.vz },
       siteR: sR, topo: topo, rho: rho,
       raDeg: rd.raDeg, decDeg: rd.decDeg,
-      ra0: pt.raDeg, dec0: pt.decDeg,
       sepDeg: sep(rd.raDeg, rd.decDeg, pt.raDeg, pt.decDeg),
-      elSin: elSin, occluded: occluded,
     };
   }
 
-  /** Is this sample inside the field? Circular fields are a plain separation test;
-   *  rectangular ones are imposed in the ROTATED CHART FRAME, because that is what
-   *  the user's camera actually is. Projection and orientation stay separate
-   *  (frames.js tanProject, then rotDeg) so the geometry never depends on flipEW. */
-  function insideField(P, sol) {
-    // Limb occlusion is part of field membership, so entry/exit bisection resolves
-    // a target RISING FROM BEHIND THE EARTH the same way it resolves a field edge.
-    if (sol.occluded) return false;
-    if (P.minElDeg > 0 && sol.elSin < P.sinMinEl) return false;
-    if (P.shape === 'circ') return sol.sepDeg <= P.fovRadiusDeg;
-    const p = tanProject(sol.raDeg, sol.decDeg, sol.ra0, sol.dec0);
-    if (!p) return false;
-    const r = P.rotDeg * D2R, cr = Math.cos(r), sr = Math.sin(r);
-    // rotDeg is the position angle of chart +Y, N through E: a point at that PA
-    // must land on the +Y axis, which fixes these signs.
-    const X = p.xi * cr - p.eta * sr;
-    const Y = p.xi * sr + p.eta * cr;
-    return Math.abs(X) <= P.halfW && Math.abs(Y) <= P.halfH;
-  }
-
   /** Refine one object's candidate windows into Crossings.
+   *
+   *  There is no sampling grid. Each window is WALKED: probe, step by however long
+   *  probe() says the membership cannot change, probe again. Where two consecutive
+   *  probes disagree the boundary between them is bisected to EDGE_TOL_MS against
+   *  the same predicate, so entry/exit and membership can never disagree; closest
+   *  approach is then a golden-section minimum of the boresight angle, bracketed
+   *  by the samples either side of the smallest one.
+   *
+   *  Rounds 1-21 sampled every window at fineStepS and kept the samples that
+   *  landed inside. At the default 1 s that MISSED any crossing shorter than a
+   *  second whenever no sample fell in it — measured on the 2026-11-15 catalogue,
+   *  9 of the 14 objects that crossed a 0.2 deg field in two hours, 12 of 32 for
+   *  0.5 deg. fineStepS now only sets the spacing of the drawn path samples.
    *
    *  Photometry is deliberately NOT done here: magEst/streak need SAT.photo, which
    *  lives on the main thread and would otherwise become a third copy of the same
    *  maths. The worker returns the geometry photometry needs (rangeKm, phaseDeg,
    *  shadow) and scan.js fills the rest in for the handful of crossings. */
-  function refine(P, k, idx, tsince0Min, ageD, slopKmVal, wins, out) {
+  function refine(P, idx, tsince0Min, ageD, slopKmVal, wins, out) {
     const rec = recs[idx];
     const obj = objs[idx];
     const fineMs = P.fineStepS * 1000;
-    const tsinceOf = (tMs) => tsince0Min + (tMs - P.t0Ms) / 60000;
-    const at = (tMs) => solveAt(P, rec, tsinceOf(tMs), tMs);
+    const at = (tMs) => probe(P, rec, tsince0Min, tMs, false);
+    const exact = (tMs) => solveAt(P, rec, tsince0Min + (tMs - P.t0Ms) / 60000, tMs);
+
+    // boundary between an outside instant and an inside one
+    const edge = (tOut, tIn) => {
+      for (let it = 0; it < 60 && Math.abs(tIn - tOut) > EDGE_TOL_MS; it++) {
+        const mid = (tIn + tOut) / 2;
+        if (at(mid).in) tIn = mid; else tOut = mid;
+      }
+      return tIn;
+    };
+
+    const emit = (tEnterF, tExitF, run) => {
+      // integer milliseconds, clamped so rounding can never step outside the run
+      const tEnter = Math.min(Math.ceil(tEnterF), Math.floor(tExitF));
+      const tExit = Math.max(Math.floor(tExitF), tEnter);
+
+      // ---- closest approach: golden-section minimum of the boresight angle ----
+      // `run` holds every probe that landed inside; add the two ends, take the
+      // smallest, and its neighbours bracket the true minimum.
+      const pts = [{ t: tEnter, sep: at(tEnter).sep }];
+      for (let q = 0; q < run.length; q++) {
+        if (run[q].t > tEnter && run[q].t < tExit) pts.push(run[q]);
+      }
+      if (tExit > tEnter) pts.push({ t: tExit, sep: at(tExit).sep });
+      let bi = 0;
+      for (let q = 1; q < pts.length; q++) if (pts[q].sep < pts[bi].sep) bi = q;
+      let lo = pts[Math.max(0, bi - 1)].t, hi = pts[Math.min(pts.length - 1, bi + 1)].t;
+      let tCa = pts[bi].t;
+      if (hi - lo > CA_TOL_MS) {
+        const G = 0.6180339887498949;
+        let x1 = hi - G * (hi - lo), x2 = lo + G * (hi - lo);
+        let f1 = at(x1).sep, f2 = at(x2).sep;
+        for (let it = 0; it < 80 && hi - lo > CA_TOL_MS; it++) {
+          if (f1 < f2) { hi = x2; x2 = x1; f2 = f1; x1 = hi - G * (hi - lo); f1 = at(x1).sep; }
+          else { lo = x1; x1 = x2; f1 = f2; x2 = lo + G * (hi - lo); f2 = at(x2).sep; }
+        }
+        tCa = (lo + hi) / 2;
+      }
+      // Round BEFORE the final solve: the crossing reports integer-ms tCaMs, and
+      // solving at the unrounded instant leaves the reported RA/Dec up to ~2"
+      // ahead of its own timestamp on a fast overhead pass (2000"/s x 0.5 ms).
+      tCa = Math.round(Math.max(tEnter, Math.min(tExit, tCa)));
+
+      const ca = exact(tCa);
+      if (!ca) return;
+
+      // TWO angular rates, because which one streaks the exposure depends on how
+      // the instrument was tracking, and they can differ by everything:
+      //
+      //   sky   — d(RA,Dec)/dt, motion against the STARS: the streak on a
+      //           sidereally-guided exposure. A geostationary satellite is NOT
+      //           stationary here — it co-rotates with the Earth and so drifts
+      //           through the star field at very nearly the sidereal rate, ~15"/s.
+      //   mount — motion against the observer's OWN frame: the horizon for a
+      //           parked ground mount (omega_E z), the LVLH frame for a staring
+      //           orbital sensor (Omega = r x v / |r|^2) — CONTRACT v0.2 gate 2.
+      //
+      // Subtracting omega x rho converts the inertial rate into the rotating frame.
+      // The cross product is formed in TEME and only then rotated to J2000, because
+      // the north/east basis the position angles are measured in lives in J2000.
+      // This is a frame change on vectors we already have, not a new propagation.
+      const siteVel = ca.siteVel;
+      const rhoDot = {
+        x: ca.velTeme.x - siteVel.x,
+        y: ca.velTeme.y - siteVel.y,
+        z: ca.velTeme.z - siteVel.z,
+      };
+      const rangeRateKmS =
+        (ca.topo.x * rhoDot.x + ca.topo.y * rhoDot.y + ca.topo.z * rhoDot.z) / ca.rho;
+      const rhoJ = temeToJ2000(ca.topo, ca.date);
+      const rhoDotJ = temeToJ2000(rhoDot, ca.date);
+      let frameOm;                     // the observer frame's rotation, TEME rad/s
+      if (P.obsKind === 'orbit') {
+        const st = ca.siteTeme, sv = ca.siteVel;
+        const r2o = st.x * st.x + st.y * st.y + st.z * st.z;
+        frameOm = {
+          x: (st.y * sv.z - st.z * sv.y) / r2o,
+          y: (st.z * sv.x - st.x * sv.z) / r2o,
+          z: (st.x * sv.y - st.y * sv.x) / r2o,
+        };
+      } else {
+        frameOm = { x: 0, y: 0, z: OMEGA_E };
+      }
+      const omegaCrossRho = temeToJ2000({
+        x: frameOm.y * ca.topo.z - frameOm.z * ca.topo.y,
+        y: frameOm.z * ca.topo.x - frameOm.x * ca.topo.z,
+        z: frameOm.x * ca.topo.y - frameOm.y * ca.topo.x,
+      }, ca.date);
+      const sky = skyRate(rhoJ, rhoDotJ, ca.rho);
+      const mount = skyRate(rhoJ, {
+        x: rhoDotJ.x - omegaCrossRho.x,
+        y: rhoDotJ.y - omegaCrossRho.y,
+        z: rhoDotJ.z - omegaCrossRho.z,
+      }, ca.rho);
+      const rateAsPerS = sky.rate, paDeg = sky.pa;
+
+      const sun = sunTemeKm(ca.date);
+      const sh = shadowState(ca.satTeme, sun);
+
+      // phase angle: Sun - satellite - observer
+      const s2o = {
+        x: ca.siteTeme.x - ca.satTeme.x, y: ca.siteTeme.y - ca.satTeme.y,
+        z: ca.siteTeme.z - ca.satTeme.z,
+      };
+      const s2s = { x: sun.x - ca.satTeme.x, y: sun.y - ca.satTeme.y, z: sun.z - ca.satTeme.z };
+      const n1 = Math.sqrt(s2o.x * s2o.x + s2o.y * s2o.y + s2o.z * s2o.z);
+      const n2 = Math.sqrt(s2s.x * s2s.x + s2s.y * s2s.y + s2s.z * s2s.z);
+      const phaseDeg = Math.acos(Math.max(-1, Math.min(1,
+        (s2o.x * s2s.x + s2o.y * s2s.y + s2o.z * s2s.z) / (n1 * n2)))) * R2D;
+
+      // Sun's height above the observer's LOCAL HORIZONTAL — twilight on the
+      // ground, the observer's own day/night state in orbit (CONTRACT v0.2
+      // gate 3). Same formula either way; only the radius is per-epoch now.
+      const sunHatDot = (sun.x * ca.siteTeme.x + sun.y * ca.siteTeme.y + sun.z * ca.siteTeme.z)
+        / (Math.sqrt(sun.x * sun.x + sun.y * sun.y + sun.z * sun.z) * ca.siteR);
+      const sunElDeg = 90 - Math.acos(Math.max(-1, Math.min(1, sunHatDot))) * R2D;
+
+      // azDeg/elDeg are alt/az on the ground, LVLH angles in orbit (gate 4).
+      let aa;
+      if (P.obsKind === 'orbit') {
+        const basis = lvlhBasis(ca.siteTeme, ca.siteVel);
+        aa = basis ? vecToLvlh(ca.topo, basis) : { azDeg: 0, elDeg: 90 };
+      } else {
+        aa = raDecToAltAz(ca.raDeg, ca.decDeg, P.site, ca.date,
+          { refract: !!P.pointing.refract, dut1S: P.dut1S });
+      }
+
+      // <= 64 path samples spanning tEnter..tExit, for the chart polyline
+      const nP = Math.max(2, Math.min(64, Math.ceil((tExit - tEnter) / fineMs) + 1));
+      const path = [];
+      for (let q = 0; q < nP; q++) {
+        const t = tEnter + (tExit - tEnter) * (q / (nP - 1));
+        const sk = probe(P, rec, tsince0Min, t, true);
+        if (sk.ok) path.push({ t: Math.round(t), raDeg: sk.raDeg, decDeg: sk.decDeg });
+      }
+
+      out.push({
+        satId: obj.id, norad: obj.norad, name: obj.name, intl: obj.intl,
+        tEnterMs: tEnter, tExitMs: tExit, tCaMs: tCa,
+        sepCaDeg: ca.sepDeg,
+        raDeg: ca.raDeg, decDeg: ca.decDeg,
+        azDeg: aa.azDeg, elDeg: aa.elDeg,
+        rangeKm: ca.rho, rangeRateKmS: rangeRateKmS,
+        rateAsPerS: rateAsPerS, paDeg: paDeg,
+        rateMountAsPerS: mount.rate, paMountDeg: mount.pa,
+        phaseDeg: phaseDeg, shadow: sh.state, sunFrac: sh.frac,
+        cls: classOf(rec), sunElDeg: sunElDeg,
+        // surfaced so the UI never presents a match found only inside the TLE
+        // slop as a confident identification (CONTRACT.md, stage 2)
+        tleAgeDays: ageD, tleSlopDeg: Math.min(TLE_SLOP_MAX_RAD, slopKmVal / ca.rho) * R2D,
+        rcs: obj.rcs, stdMag: obj.stdMag,
+        path: path,
+      });
+    };
 
     // merge overlapping windows, then clamp to the scan span
     const merged = [];
     wins.slice().sort((a, b) => a[0] - b[0]).forEach((w) => {
       const a = Math.max(P.t0Ms, w[0]), b = Math.min(P.t1Ms, w[1]);
-      if (b <= a) return;
+      if (b < a) return;
       const last = merged[merged.length - 1];
       if (last && a <= last[1]) last[1] = Math.max(last[1], b);
       else merged.push([a, b]);
@@ -1165,167 +1636,21 @@
 
     for (let wi = 0; wi < merged.length; wi++) {
       const wa = merged[wi][0], wb = merged[wi][1];
-      const nS = Math.min(FINE_SAMPLE_CAP, Math.max(1, Math.ceil((wb - wa) / fineMs)));
-      const dtMs = (wb - wa) / nS;
-      const samples = [];
-      for (let i = 0; i <= nS; i++) {
-        const t = Math.min(wb, wa + i * dtMs);
-        const sol = at(t);
-        samples.push(sol ? { t: t, sol: sol, in: insideField(P, sol) } : { t: t, sol: null, in: false });
+      let cur = at(wa);
+      let run = cur.in ? [cur] : null;
+      let tEnter = cur.in ? wa : NaN;
+      for (let guard = 0; cur.t < wb && guard < MAX_PROBES; guard++) {
+        const nxt = at(Math.min(wb, cur.t + cur.h * 1000));
+        if (cur.in && !nxt.in) {
+          emit(tEnter, edge(nxt.t, cur.t), run);
+          run = null;
+        } else if (!cur.in && nxt.in) {
+          tEnter = edge(cur.t, nxt.t);
+          run = [nxt];
+        } else if (nxt.in) run.push(nxt);
+        cur = nxt;
       }
-
-      // contiguous in-field runs
-      let i = 0;
-      while (i <= nS) {
-        if (!samples[i].in) { i++; continue; }
-        let a = i;
-        while (i + 1 <= nS && samples[i + 1].in) i++;
-        const b = i;
-        i++;
-
-        // Bisect the boundary to 50 ms against the SAME insideField predicate that
-        // produced the samples, so entry/exit and membership can never disagree.
-        const bisect = (tOut, tIn) => {
-          for (let it = 0; it < 40 && Math.abs(tIn - tOut) > 50; it++) {
-            const mid = (tIn + tOut) / 2;
-            const sol = at(mid);
-            if (sol && insideField(P, sol)) tIn = mid; else tOut = mid;
-          }
-          return Math.round(tIn);
-        };
-        let tEnter = samples[a].t, tExit = samples[b].t;
-        if (a > 0) tEnter = bisect(samples[a - 1].t, samples[a].t);
-        if (b < nS) tExit = bisect(samples[b + 1].t, samples[b].t);
-
-        // Closest approach by parabolic fit on the separation minimum.
-        let bi = a;
-        for (let q = a; q <= b; q++) if (samples[q].sol.sepDeg < samples[bi].sol.sepDeg) bi = q;
-        let tCa = samples[bi].t;
-        if (bi > a && bi < b) {
-          const y0 = samples[bi - 1].sol.sepDeg, y1 = samples[bi].sol.sepDeg,
-            y2 = samples[bi + 1].sol.sepDeg;
-          const den = y0 - 2 * y1 + y2;
-          if (den > 0) {
-            const dt = 0.5 * (y0 - y2) / den;               // in units of the fine step
-            if (dt > -1 && dt < 1) tCa = samples[bi].t + dt * dtMs;
-          }
-        }
-        // Round BEFORE the final solve: the crossing reports integer-ms tCaMs, and
-        // solving at the unrounded instant leaves the reported RA/Dec up to ~2"
-        // ahead of its own timestamp on a fast overhead pass (2000"/s x 0.5 ms).
-        tCa = Math.round(Math.max(tEnter, Math.min(tExit, tCa)));
-
-        const ca = at(tCa);
-        if (!ca) continue;
-
-        // TWO angular rates, because which one streaks the exposure depends on how
-        // the instrument was tracking, and they can differ by everything:
-        //
-        //   sky   — d(RA,Dec)/dt, motion against the STARS: the streak on a
-        //           sidereally-guided exposure. A geostationary satellite is NOT
-        //           stationary here — it co-rotates with the Earth and so drifts
-        //           through the star field at very nearly the sidereal rate, ~15"/s.
-        //   mount — motion against the observer's OWN frame: the horizon for a
-        //           parked ground mount (omega_E z), the LVLH frame for a staring
-        //           orbital sensor (Omega = r x v / |r|^2) — CONTRACT v0.2 gate 2.
-        //
-        // Subtracting omega x rho converts the inertial rate into the rotating frame.
-        // The cross product is formed in TEME and only then rotated to J2000, because
-        // the north/east basis the position angles are measured in lives in J2000.
-        // This is a frame change on vectors we already have, not a new propagation.
-        const siteVel = ca.siteVel;
-        const rhoDot = {
-          x: ca.velTeme.x - siteVel.x,
-          y: ca.velTeme.y - siteVel.y,
-          z: ca.velTeme.z - siteVel.z,
-        };
-        const rangeRateKmS =
-          (ca.topo.x * rhoDot.x + ca.topo.y * rhoDot.y + ca.topo.z * rhoDot.z) / ca.rho;
-        const rhoJ = temeToJ2000(ca.topo, ca.date);
-        const rhoDotJ = temeToJ2000(rhoDot, ca.date);
-        let frameOm;                     // the observer frame's rotation, TEME rad/s
-        if (P.obsKind === 'orbit') {
-          const st = ca.siteTeme, sv = ca.siteVel;
-          const r2o = st.x * st.x + st.y * st.y + st.z * st.z;
-          frameOm = {
-            x: (st.y * sv.z - st.z * sv.y) / r2o,
-            y: (st.z * sv.x - st.x * sv.z) / r2o,
-            z: (st.x * sv.y - st.y * sv.x) / r2o,
-          };
-        } else {
-          frameOm = { x: 0, y: 0, z: OMEGA_E };
-        }
-        const omegaCrossRho = temeToJ2000({
-          x: frameOm.y * ca.topo.z - frameOm.z * ca.topo.y,
-          y: frameOm.z * ca.topo.x - frameOm.x * ca.topo.z,
-          z: frameOm.x * ca.topo.y - frameOm.y * ca.topo.x,
-        }, ca.date);
-        const sky = skyRate(rhoJ, rhoDotJ, ca.rho);
-        const mount = skyRate(rhoJ, {
-          x: rhoDotJ.x - omegaCrossRho.x,
-          y: rhoDotJ.y - omegaCrossRho.y,
-          z: rhoDotJ.z - omegaCrossRho.z,
-        }, ca.rho);
-        const rateAsPerS = sky.rate, paDeg = sky.pa;
-
-        const sun = sunTemeKm(ca.date);
-        const sh = shadowState(ca.satTeme, sun);
-
-        // phase angle: Sun - satellite - observer
-        const s2o = {
-          x: ca.siteTeme.x - ca.satTeme.x, y: ca.siteTeme.y - ca.satTeme.y,
-          z: ca.siteTeme.z - ca.satTeme.z,
-        };
-        const s2s = { x: sun.x - ca.satTeme.x, y: sun.y - ca.satTeme.y, z: sun.z - ca.satTeme.z };
-        const n1 = Math.sqrt(s2o.x * s2o.x + s2o.y * s2o.y + s2o.z * s2o.z);
-        const n2 = Math.sqrt(s2s.x * s2s.x + s2s.y * s2s.y + s2s.z * s2s.z);
-        const phaseDeg = Math.acos(Math.max(-1, Math.min(1,
-          (s2o.x * s2s.x + s2o.y * s2s.y + s2o.z * s2s.z) / (n1 * n2)))) * R2D;
-
-        // Sun's height above the observer's LOCAL HORIZONTAL — twilight on the
-        // ground, the observer's own day/night state in orbit (CONTRACT v0.2
-        // gate 3). Same formula either way; only the radius is per-epoch now.
-        const sunHatDot = (sun.x * ca.siteTeme.x + sun.y * ca.siteTeme.y + sun.z * ca.siteTeme.z)
-          / (Math.sqrt(sun.x * sun.x + sun.y * sun.y + sun.z * sun.z) * ca.siteR);
-        const sunElDeg = 90 - Math.acos(Math.max(-1, Math.min(1, sunHatDot))) * R2D;
-
-        // azDeg/elDeg are alt/az on the ground, LVLH angles in orbit (gate 4).
-        let aa;
-        if (P.obsKind === 'orbit') {
-          const basis = lvlhBasis(ca.siteTeme, ca.siteVel);
-          aa = basis ? vecToLvlh(ca.topo, basis) : { azDeg: 0, elDeg: 90 };
-        } else {
-          aa = raDecToAltAz(ca.raDeg, ca.decDeg, P.site, ca.date,
-            { refract: !!P.pointing.refract, dut1S: P.dut1S });
-        }
-
-        // <= 64 path samples spanning tEnter..tExit, for the chart polyline
-        const nP = Math.max(2, Math.min(64, Math.ceil((tExit - tEnter) / fineMs) + 1));
-        const path = [];
-        for (let q = 0; q < nP; q++) {
-          const t = tEnter + (tExit - tEnter) * (nP === 1 ? 0 : q / (nP - 1));
-          const sol = at(t);
-          if (sol) path.push({ t: Math.round(t), raDeg: sol.raDeg, decDeg: sol.decDeg });
-        }
-
-        out.push({
-          satId: obj.id, norad: obj.norad, name: obj.name, intl: obj.intl,
-          tEnterMs: tEnter, tExitMs: tExit, tCaMs: Math.round(tCa),
-          sepCaDeg: ca.sepDeg,
-          raDeg: ca.raDeg, decDeg: ca.decDeg,
-          azDeg: aa.azDeg, elDeg: aa.elDeg,
-          rangeKm: ca.rho, rangeRateKmS: rangeRateKmS,
-          rateAsPerS: rateAsPerS, paDeg: paDeg,
-          rateMountAsPerS: mount.rate, paMountDeg: mount.pa,
-          phaseDeg: phaseDeg, shadow: sh.state, sunFrac: sh.frac,
-          cls: classOf(rec), sunElDeg: sunElDeg,
-          // surfaced so the UI never presents a match found only inside the TLE
-          // slop as a confident identification (CONTRACT.md, stage 2)
-          tleAgeDays: ageD, tleSlopDeg: Math.min(TLE_SLOP_MAX_RAD, slopKmVal / ca.rho) * R2D,
-          rcs: obj.rcs, stdMag: obj.stdMag,
-          path: path,
-        });
-      }
+      if (run) emit(tEnter, wb, run);
     }
   }
 
@@ -1333,6 +1658,7 @@
 
   const core = {
     loadObjs: loadObjs, runScan: runScan, stage1: stage1, prepare: prepare,
+    clearTime: clearTime, buildTables: buildTables, fieldSetup: fieldSetup, probe: probe,
     cancel: () => { cancelled = true; },
     count: () => objs.length,
   };
@@ -1358,7 +1684,8 @@
         if (job) job.then((res) => {
           self.postMessage({
             type: 'result', crossings: res.crossings, culled: res.culled,
-            propagations: res.propagations, ms: res.ms,
+            propagations: res.propagations, gridPropagations: res.gridPropagations,
+            timing: res.timing, ms: res.ms,
           });
         }).catch((err) => {
           if (err && err.message === 'cancelled') {

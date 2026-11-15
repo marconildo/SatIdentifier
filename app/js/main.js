@@ -34,14 +34,26 @@
           'Info for exactly this reason.'),
         U.el('li', null, 'UT1−UTC is ignored by default (≤0.9 s, up to ~2.9′ of apparent ' +
           'shift at LEO). Set DUT1 in Pointing if you need it.'),
-        U.el('li', null, 'Annual aberration (≤20.5″) is applied to neither satellites nor ' +
-          'stars, so the chart and the satellites stay mutually consistent. Do not correct ' +
-          'one side alone.'),
+        U.el('li', null, 'Positions are astrometric: light time is applied (the satellite ' +
+          'is drawn where it was when the light left it — 5″ for LEO, 2″ for GEO), and ' +
+          'aberration (≤20.5″) is applied to neither satellites nor stars, so the chart ' +
+          'and the satellites stay mutually consistent. That is the place a plate ' +
+          'solution against catalogue stars measures.'),
         U.el('li', null, 'Magnitudes are estimates. “qsmag” uses a McCants standard ' +
           'magnitude; “rcs” assumes a diffuse sphere of the SATCAT radar cross-section; ' +
           '“default” assumes a 1 m sphere and is a guess, flagged as such.'),
       ]),
       U.el('div', { class: 'sep' }),
+      U.el('p', { style: 'margin:4px 0' }, [U.el('b', null, 'Sky Chart: '),
+        'The frame is your image; names sit outside it at each trail’s end. Ticks along a ' +
+        'trail are round UTC instants — hover or click a trail anywhere along its length ' +
+        'to read them, with entry and exit times. A dashed trail is in the Earth’s shadow ' +
+        'and cannot be an optical streak. The strip under the chart is the scan window: ' +
+        'one bar per crossing; drag it to move the clock, click a bar to jump to that ' +
+        'object’s closest approach. Ruler (R): drag along a streak to get its length and ' +
+        'position angle and the predicted trails that match it best. On a parked mount ' +
+        'the stars trail over the exposure, as they do in the frame. Hover a star for its ' +
+        'V magnitude. Wheel zooms, drag pans, double-click re-aims, F fits, Esc clears.']),
       U.el('p', { style: 'margin:4px 0' }, [U.el('b', null, 'Clock: '),
         'The field accepts YYYY-MM-DD HH:MM:SS (UTC). Put the caret on a segment and press ↑/↓ ' +
         'to step it. Rates run time forward and backward; the chart animates the crossings ' +
@@ -50,8 +62,9 @@
         'Space = run/pause · N = jump to real time · S = scan (when not typing in a field).']),
       U.el('div', { class: 'sep' }),
       U.el('p', { class: 'dim', style: 'margin:4px 0;font-size:11px' },
-        'Propagation: satellite.js (SGP4/SDP4). Stars: Tycho-2 to V=9.0 (Hog+ 2000) with ' +
-        'BSC5/HYG photometry at the bright end. Data: CelesTrak, Space-Track, Mike McCants. ' +
+        'Propagation: satellite.js (SGP4/SDP4). Stars: Gaia DR3 to V=10.5 bundled (V=13 ' +
+        'with the optional deep tiles), BSC5/HYG photometry at the bright end. Data: ' +
+        'CelesTrak, Space-Track, Mike McCants. ' +
         'Scan algorithm owes its structure to Bill Gray’s sat_code. ' +
         'State is saved automatically next to server.py.'),
     ]));

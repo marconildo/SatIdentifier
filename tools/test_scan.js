@@ -1,5 +1,5 @@
 /* Verification for app/js/worker/scan-worker.js — the scan engine's core.
- * Run: node tools/test_scan.js [path/to/catalogue.tle]
+ * Run: node tools/test_scan.js [path/to/catalogue.tle | cache.json]
  *
  * Three things are checked, in increasing order of how badly a failure would hurt:
  *
@@ -13,6 +13,14 @@
  *  (c) COST — wall clock and the per-stage culled counts, which the UI has to
  *      show: a scan that removes 90% of the catalogue must say so, or a bug in
  *      the cull is indistinguishable from "no satellites tonight".
+ *
+ * Round 22 added the three checks that pin the rewritten stages 2 and 3:
+ *  (r) RECALL against an exhaustive brute force that shares nothing with the
+ *      engine — every crossing found, sub-second ones included;
+ *  (k) the CLEAR-TIME BOUND itself, walked instant by instant;
+ *  (h) nothing reported from below the horizon.
+ *
+ * With no argument the catalogue is the app's own disk cache (data/cache/).
  */
 const fs = require('fs');
 const path = require('path');
@@ -34,47 +42,70 @@ function ok(name, cond, detail) {
 
 /* ---- catalogue ----------------------------------------------------------- */
 
+const DATA = path.join(__dirname, '..', 'data', 'cache');
 const CANDIDATES = [
   process.argv[2],
+  // the app's own disk cache: present after any full-catalogue load in dev mode
+  path.join(DATA, 'celestrak_full.json'),
+  path.join(DATA, 'catalog_full.json'),
   '/tmp/active.tle',
-  path.join('/private/tmp/claude-502/-Users-mickey-sda-satidentifier',
-    '8f585dfb-8b71-4dc2-9b62-f86b2af3ea20', 'scratchpad', 'active.tle'),
 ].filter(Boolean);
 
 const src = CANDIDATES.find((p) => { try { return fs.statSync(p).isFile(); } catch (e) { return false; } });
 if (!src) {
-  console.error('No catalogue found. Fetch one with:\n  curl -s -A "SatIdentifier/0.1" ' +
-    '"https://celestrak.org/NORAD/elements/gp.php?GROUP=active&FORMAT=tle" -o /tmp/active.tle');
+  console.error('No catalogue found. Load one in the app (dev mode writes data/cache/), ' +
+    'or pass a 3LE file:\n  node tools/test_scan.js path/to/catalogue.tle');
   process.exit(2);
 }
 
-const lines = fs.readFileSync(src, 'utf8').split(/\r?\n/);
+/** TLE catalogue-number field -> integer, Alpha-5 included ('A0057' = 100057;
+ *  I and O are skipped). parseInt alone turns every 6-digit object into NaN, and
+ *  an id built from that collides — which is how this harness once "found" a
+ *  crossing 160 degrees outside the field: it had looked up the wrong object. */
+function catnum(f) {
+  const c = f.charCodeAt(0);
+  if (c >= 65 && c <= 90) {
+    const v = c - 55 - (c > 73 ? 1 : 0) - (c > 79 ? 1 : 0);
+    return v * 10000 + parseInt(f.slice(1), 10);
+  }
+  return parseInt(f, 10);
+}
+
 const objs = [];
-for (let i = 0; i + 2 < lines.length; i += 3) {
-  const l1 = lines[i + 1], l2 = lines[i + 2];
-  if (!l1 || l1[0] !== '1' || !l2 || l2[0] !== '2') continue;
-  const norad = parseInt(l2.slice(2, 7), 10);
+function addObj(name, l1, l2) {
+  if (!l1 || l1[0] !== '1' || !l2 || l2[0] !== '2') return;
   objs.push({
-    id: 'o_' + norad, norad: norad, name: (lines[i] || '').trim(),
+    id: 'o_' + objs.length, norad: catnum(l2.slice(2, 7)), name: (name || '').trim(),
     intl: l1.slice(9, 17).trim(), l1: l1, l2: l2, rcs: null, stdMag: null,
   });
 }
+if (/\.json$/.test(src)) {
+  JSON.parse(fs.readFileSync(src, 'utf8')).tles.forEach((t) => addObj(t.name, t.l1, t.l2));
+} else {
+  const lines = fs.readFileSync(src, 'utf8').split(/\r?\n/);
+  for (let i = 0; i + 2 < lines.length; i += 3) addObj(lines[i], lines[i + 1], lines[i + 2]);
+}
 console.log(`catalogue: ${src}\n           ${objs.length} objects`);
+const byId = new Map(objs.map((o) => [o.id, o]));
 
 let t = Date.now();
 const loaded = worker.loadObjs(objs);
 console.log(`           ${loaded.count} satrecs built in ${Date.now() - t} ms ` +
   `(${loaded.bad} rejected as invalid)`);
 
-// The catalogue's newest element epoch fixes a sensible scan time: scanning a week
-// away from the elements would exercise TLE decay, not the scan engine.
-let newest = 0;
+// The catalogue's MEDIAN element epoch fixes a sensible scan time: scanning a week
+// away from the elements would exercise TLE decay, not the scan engine. (The
+// newest epoch is not safe — a single pre-launch or mis-dated element set sits
+// weeks ahead of everything else and drags the whole run there.)
+const epochs = [];
 for (const o of objs) {
   const r = satellite.twoline2satrec(o.l1, o.l2);
-  if (r && isFinite(r.jdsatepoch) && r.jdsatepoch > newest) newest = r.jdsatepoch;
+  if (r && isFinite(r.jdsatepoch)) epochs.push(r.jdsatepoch);
 }
-const T0 = new Date(Math.round((newest - 2440587.5) * 86400000 / 1000) * 1000);
-console.log(`           newest element epoch ${T0.toISOString()} — scanning from there`);
+epochs.sort((x, y) => x - y);
+const medianJd = epochs[epochs.length >> 1];
+const T0 = new Date(Math.round((medianJd - 2440587.5) * 86400) * 1000);
+console.log(`           median element epoch ${T0.toISOString()} — scanning from there`);
 
 /* ---- scan parameters ----------------------------------------------------- */
 
@@ -93,21 +124,44 @@ function params(over) {
   }, over || {});
 }
 
+const C_KM_S = 299792.458;
+
+/** Astrometric topocentric vector (TEME) at `d`: the satellite where it was when
+ *  the light left it. Iterated, re-propagating to the retarded time each pass —
+ *  the worker applies the first-order form, so this is a different computation. */
+function astrometricTopo(rec, d, obsPos) {
+  let topo = null, rho = 0;
+  for (let it = 0; it < 3; it++) {
+    // a Date holds whole milliseconds: propagate to the millisecond at or before
+    // the retarded instant and carry the remaining fraction on the velocity
+    const tRet = d.getTime() - rho / C_KM_S * 1000;
+    const whole = Math.floor(tRet), rem = (tRet - whole) / 1000;
+    const pv = satellite.propagate(rec, new Date(whole));
+    if (!pv || !pv.position) return null;
+    topo = {
+      x: pv.position.x + pv.velocity.x * rem - obsPos.x,
+      y: pv.position.y + pv.velocity.y * rem - obsPos.y,
+      z: pv.position.z + pv.velocity.z * rem - obsPos.z,
+    };
+    rho = Math.hypot(topo.x, topo.y, topo.z);
+  }
+  return topo;
+}
+
 /** Recompute a crossing's separation from the field centre from first principles:
- *  raw SGP4 -> topocentric TEME -> J2000 via frames.js -> Vincenty separation.
- *  Shares nothing with the worker except satellite.js itself. */
+ *  raw SGP4 -> astrometric topocentric TEME -> J2000 via frames.js -> Vincenty
+ *  separation. Shares nothing with the worker except satellite.js itself. */
 function independentSep(cr, p) {
-  const o = objs.find((x) => x.id === cr.satId);
+  const o = byId.get(cr.satId);
   const rec = satellite.twoline2satrec(o.l1, o.l2);
   const d = new Date(cr.tCaMs);
-  const pv = satellite.propagate(rec, d);
-  if (!pv || !pv.position) return null;
-  const topo = F.topoTeme(p.site, pv.position, d);
+  const topo = astrometricTopo(rec, d, F.siteTemeKm(p.site, d, 0));
+  if (!topo) return null;
   const rd = F.vecToRaDec(F.temeToJ2000(topo, d));
   const aa = F.raDecToAltAz(rd.raDeg, rd.decDeg, p.site, d, { refract: false });
   return {
     sepDeg: F.sep(rd.raDeg, rd.decDeg, p.pointing.raDeg, p.pointing.decDeg),
-    raDeg: rd.raDeg, decDeg: rd.decDeg, elDeg: aa.elDeg,
+    raDeg: rd.raDeg, decDeg: rd.decDeg, elDeg: aa.elDeg, topo: topo,
   };
 }
 
@@ -149,13 +203,15 @@ async function scan(p, label) {
     if (ind.sepDeg > worstSep) { worstSep = ind.sepDeg; worstName = c.name; }
     const dRa = F.sep(ind.raDeg, ind.decDeg, c.raDeg, c.decDeg) * 3600;
     if (dRa > worstRa) worstRa = dRa;
-    if (dRa > 1.0) badRa++;
+    // 0.5": the reference goes through satellite.propagate(Date), whose Julian
+    // date resolves only ~40 us — 0.3 m of LEO motion, 0.2" at 300 km range
+    if (dRa > 0.5) badRa++;
   }
   ok('every crossing is inside the FOV at tCaMs (independent recompute)',
     worstSep <= pA.fov.rDeg,
     `worst ${worstSep.toFixed(4)} deg vs ${pA.fov.rDeg} deg limit  [${worstName}]  (${checked} checked)`);
-  ok('reported RA/Dec matches an independent recompute to < 1 arcsec',
-    badRa === 0, `worst ${worstRa.toFixed(4)} arcsec`);
+  ok('reported RA/Dec matches an independent ASTROMETRIC recompute to < 0.5 arcsec',
+    badRa === 0, `worst ${worstRa.toFixed(4)} arcsec (light time included on both sides)`);
 
   let monotone = true, pathOk = true, ordered = true;
   let prev = -Infinity;
@@ -340,7 +396,7 @@ async function scan(p, label) {
   // ground pipeline shipped with — cull on/off identity, independent recompute —
   // plus the physics the amendment added: limb occlusion and self-exclusion.
   console.log('\n[o] orbital observing station');
-  const issObj = objs.find((o) => o.norad === 25544) ||
+  const issObj = objs.find((o) => o.norad === 25544 && /ZARYA/.test(o.name)) ||
     objs.find((o) => /^ISS \(ZARYA\)/.test(o.name));
   ok('catalogue contains an ISS to observe from (test scaffold)', !!issObj,
     issObj ? issObj.name : 'NOT FOUND');
@@ -428,19 +484,18 @@ async function scan(p, label) {
           let worstAs = 0;
           let n = 0;
           for (const cr of V.crossings) {
-            const o = objs.find((x) => x.id === cr.satId);
+            const o = byId.get(cr.satId);
             const rec2 = satellite.twoline2satrec(o.l1, o.l2);
             const d = new Date(cr.tCaMs);
-            const s = stateOf(issRec, d), g = stateOf(rec2, d);
-            if (!s || !g) continue;
-            const topo = { x: g.position.x - s.position.x, y: g.position.y - s.position.y,
-              z: g.position.z - s.position.z };
+            const s = stateOf(issRec, d);
+            const topo = s && astrometricTopo(rec2, d, s.position);
+            if (!topo) continue;
             const rd = F.vecToRaDec(F.temeToJ2000(topo, d));
             worstAs = Math.max(worstAs, F.sep(rd.raDeg, rd.decDeg, cr.raDeg, cr.decDeg) * 3600);
             n++;
           }
-          ok('orbital RA/Dec matches an independent recompute to < 1 arcsec',
-            worstAs < 1.0, `worst ${worstAs.toFixed(4)} arcsec over ${n}`);
+          ok('orbital RA/Dec matches an independent astrometric recompute to < 0.5 arcsec',
+            worstAs < 0.5, `worst ${worstAs.toFixed(4)} arcsec over ${n}`);
         }
       }
     }
@@ -478,6 +533,198 @@ async function scan(p, label) {
       ok('zenith-stare crossings all report near-zenith LVLH elevation',
         worstEl > 90 - 15 - 10, `lowest ElL ${worstEl.toFixed(1)} deg`);
     }
+  }
+
+  // ------------------------------------------------------------------ test r
+  // RECALL AGAINST BRUTE FORCE. Rounds 1-21 sampled each candidate window once a
+  // second and kept what landed inside, so a LEO object crossing a small field in
+  // 0.3 s was found only when a sample happened to fall in it. The reference here
+  // shares nothing with the engine: every object, every second, a plain TEME
+  // angle to the boresight with a margin no orbit can beat (3 deg/s — an object
+  // 150 km overhead manages 2.9), and every second that passes it is re-sampled
+  // every 5 ms through frames.js with iterated light time.
+  console.log('\n[r] recall against brute force: 6 x 0.5 deg strip near the zenith, 12 min, every object');
+  {
+    // A long thin strip high in the sky: plenty of LEO traffic, and almost all of
+    // it crosses the 0.5 deg dimension in well under a second.
+    const SPAN = 12;
+    const aim = F.altAzToRaDec(180, 78, SITE, new Date(T0.getTime() + SPAN * 30000), { refract: false });
+    const pR = params({
+      spanMin: SPAN,
+      pointing: { track: 'sky', mode: 'radec', raDeg: aim.raDeg, decDeg: aim.decDeg, refract: true },
+      fov: { shape: 'rect', wDeg: 6, hDeg: 0.5, rDeg: 0, rotDeg: 35 },
+    });
+    const R = await scan(pR, 'engine');
+    const t0 = pR.t0Ms, t1 = t0 + SPAN * 60000;
+    const halfW = 3, halfH = 0.25, Rc = Math.hypot(halfW, halfH);
+    const rot = 35 * F.D2R, cr = Math.cos(rot), sr = Math.sin(rot);
+    const bJ = F.raDecToVec(aim.raDeg, aim.decDeg);
+    const inside = (rec, tMs) => {
+      const d = new Date(tMs);
+      const site = F.siteTemeKm(pR.site, d, 0);
+      const topo = astrometricTopo(rec, d, site);
+      if (!topo) return false;
+      if (topo.x * site.x + topo.y * site.y + topo.z * site.z <= 0) return false;   // horizon
+      const rd = F.vecToRaDec(F.temeToJ2000(topo, d));
+      const tp = F.tanProject(rd.raDeg, rd.decDeg, aim.raDeg, aim.decDeg);
+      if (!tp) return false;
+      const X = tp.xi * cr - tp.eta * sr, Y = tp.xi * sr + tp.eta * cr;
+      return Math.abs(X) <= halfW && Math.abs(Y) <= halfH;
+    };
+    const tBrute = Date.now();
+    const cosGate = Math.cos((Rc + 3.0) * F.D2R);
+    const truth = [];                       // [{id, a, b}]
+    const nSec = Math.round((t1 - t0) / 1000);
+    const bT = [], sT = [];
+    for (let k = 0; k <= nSec; k++) {
+      const d = new Date(t0 + k * 1000);
+      bT.push(F.j2000ToTeme(bJ, d));
+      sT.push(F.siteTemeKm(pR.site, d, 0));
+    }
+    for (const o of objs) {
+      const rec = satellite.twoline2satrec(o.l1, o.l2);
+      if (!rec || !isFinite(rec.jdsatepoch)) continue;
+      const ts0 = (t0 / 86400000 + 2440587.5 - rec.jdsatepoch) * 1440;
+      let open = null, lastFine = -Infinity;
+      for (let k = 0; k <= nSec; k++) {
+        const pv = satellite.sgp4(rec, ts0 + k / 60);
+        if (!pv || !pv.position) continue;
+        const s = sT[k], b = bT[k];
+        const wx = pv.position.x - s.x, wy = pv.position.y - s.y, wz = pv.position.z - s.z;
+        if ((wx * b.x + wy * b.y + wz * b.z) < cosGate * Math.sqrt(wx * wx + wy * wy + wz * wz)) continue;
+        const from = Math.max(t0 + (k - 1) * 1000, lastFine + 5, t0), to = Math.min(t0 + (k + 1) * 1000, t1);
+        for (let t = from; t <= to; t += 5) {
+          const v = inside(rec, t);
+          if (v && open == null) open = t;
+          if (!v && open != null) { truth.push({ id: o.id, a: open, b: t - 5 }); open = null; }
+          lastFine = t;
+        }
+      }
+      if (open != null) truth.push({ id: o.id, a: open, b: lastFine });
+    }
+    console.log(`  brute force: ${truth.length} crossings in ${Date.now() - tBrute} ms ` +
+      `(${truth.filter((x) => x.b - x.a < 1000).length} of them shorter than 1 s)`);
+    const tol = 25;                         // 5 ms reference grid + 10 ms bisection, with room
+    const match = (x, c) => c.satId === x.id && Math.abs(c.tEnterMs - x.a) <= tol &&
+      Math.abs(c.tExitMs - x.b) <= tol;
+    const missed = truth.filter((x) => !R.crossings.some((c) => match(x, c)));
+    const spurious = R.crossings.filter((c) => !truth.some((x) => match(x, c)));
+    ok('brute force finds crossings, sub-second ones among them (else vacuous)',
+      truth.length > 3 && truth.some((x) => x.b - x.a < 1000), `(${truth.length})`);
+    ok('the engine finds EVERY crossing the brute force finds, entry and exit within 25 ms',
+      missed.length === 0,
+      missed.length ? `MISSED ${missed.length}: ` + missed.slice(0, 5).map((x) =>
+        `${byId.get(x.id).name} ${((x.b - x.a) / 1000).toFixed(2)} s`).join(', ') : `${truth.length} of ${truth.length}`);
+    ok('and reports nothing the brute force does not', spurious.length === 0,
+      spurious.length ? spurious.slice(0, 5).map((c) => c.name + ' ' +
+        ((c.tExitMs - c.tEnterMs) / 1000).toFixed(2) + ' s').join(', ') : '');
+  }
+
+  // ------------------------------------------------------------------ test k
+  // THE CLEAR-TIME BOUND, checked directly. Stage 2 skips ahead by clearTime()
+  // and stage 3 steps by it, so if the bound were ever too long an object would
+  // be skipped past the field and never looked at. For random objects at random
+  // times: take the bound, then walk the whole interval it vouches for — forwards
+  // and backwards — and check the object stays outside the field's circumscribing
+  // circle throughout. Sidereal, parked-mount and LVLH pointings.
+  console.log('\n[k] the clear-time bound holds: nothing reaches the field inside it');
+  {
+    const issK = objs.find((o) => /^ISS \(ZARYA\)/.test(o.name));
+    const cases = [
+      ['sidereal 3 deg', params({ spanMin: 360, fov: { shape: 'circ', rDeg: 3, wDeg: 0, hDeg: 0, rotDeg: 0 } })],
+      ['parked mount 5x4 deg', params({ spanMin: 360,
+        pointing: { track: 'mount', mode: 'altaz', azDeg: 200, elDeg: 50, refract: true },
+        fov: { shape: 'rect', wDeg: 5, hDeg: 4, rDeg: 0, rotDeg: 0 } })],
+    ];
+    if (issK) {
+      cases.push(['LVLH-fixed 10 deg, from orbit', params({ spanMin: 180,
+        site: { kind: 'orbit', norad: issK.norad, l1: issK.l1, l2: issK.l2, name: issK.name },
+        pointing: { track: 'mount', mode: 'altaz', azDeg: 60, elDeg: 25, refract: false },
+        fov: { shape: 'circ', rDeg: 10, wDeg: 0, hDeg: 0, rotDeg: 0 } })]);
+    }
+    let seed = 20261115;
+    const rnd = () => { seed = (seed * 1664525 + 1013904223) >>> 0; return seed / 4294967296; };
+    for (const [label, pK] of cases) {
+      const P = worker.prepare(pK);
+      P.field = worker.fieldSetup(P);
+      const tabs = worker.buildTables(P);
+      const stepMs = P.coarseStepS * 1000;
+      const Rdeg = P.fovRadiusDeg;
+      // boresight and observer at an arbitrary instant, by interpolating nothing:
+      // evaluate on the table's own grid, which is what stage 2 does
+      const geom = (rec, k) => {
+        const pv = satellite.sgp4(rec, (P.t0Ms / 86400000 + 2440587.5 - rec.jdsatepoch) * 1440 + k * P.coarseStepS / 60);
+        if (!pv || !pv.position) return null;
+        const o = k * 3, r = pv.position;
+        const dx = r.x - tabs.tabS[o], dy = r.y - tabs.tabS[o + 1], dz = r.z - tabs.tabS[o + 2];
+        const rho = Math.hypot(dx, dy, dz);
+        const proj = dx * tabs.tabP[o] + dy * tabs.tabP[o + 1] + dz * tabs.tabP[o + 2];
+        return { r: r, v: pv.velocity, rho: rho, proj: proj,
+          D: proj > 0 ? Math.sqrt(Math.max(0, rho * rho - proj * proj)) : rho,
+          sepDeg: Math.acos(Math.max(-1, Math.min(1, proj / rho))) * F.R2D };
+      };
+      let trials = 0, violations = 0, worst = Infinity, longest = 0, checked = 0;
+      while (trials < 4000) {
+        const o = objs[Math.floor(rnd() * objs.length)];
+        const rec = satellite.twoline2satrec(o.l1, o.l2);
+        if (!rec || !isFinite(rec.jdsatepoch)) continue;
+        const k = Math.floor(rnd() * P.nSteps);
+        const g = geom(rec, k);
+        if (!g) continue;
+        const clear = worker.clearTime(P, g.rho, g.D, g.r, g.v);
+        if (!(clear >= P.coarseStepS)) continue;        // the bound is only USED from one step up
+        trials++;
+        longest = Math.max(longest, clear);
+        const nk = Math.floor(clear * 1000 / stepMs);
+        for (const dir of [1, -1]) {
+          for (let j = 1; j <= nk; j++) {
+            const kk = k + dir * j;
+            if (kk < 0 || kk >= P.nSteps) break;
+            const h = geom(rec, kk);
+            if (!h) continue;
+            checked++;
+            const margin = h.sepDeg - Rdeg;             // > 0 means outside the field
+            if (margin < worst) worst = margin;
+            if (margin <= 0) violations++;
+          }
+        }
+      }
+      ok(`${label}: no object is inside the field anywhere within its clear time`,
+        violations === 0,
+        `${trials} bounds, ${checked} instants walked, longest ${(longest / 60).toFixed(0)} min, ` +
+        `closest approach to the field edge ${worst.toFixed(2)} deg` +
+        (violations ? `; ${violations} VIOLATIONS` : ''));
+    }
+  }
+
+  // ------------------------------------------------------------------ test h
+  // A ground target is in the field only while it is above the horizon. A field
+  // low on the horizon (centre at 6 deg, 10 deg wide) hangs partly below it, and
+  // rounds 1-21 reported the below-horizon part whenever a neighbouring coarse
+  // sample happened to be above.
+  console.log('\n[h] a low field reports nothing from below the horizon');
+  {
+    const pH = params({
+      spanMin: 60,
+      pointing: { track: 'mount', mode: 'altaz', azDeg: 120, elDeg: 6, refract: true },
+      fov: { shape: 'rect', wDeg: 10, hDeg: 10, rDeg: 0, rotDeg: 0 },
+    });
+    const H = await scan(pH, 'field centred at El 6 deg');
+    let lowest = Infinity, n = 0;
+    for (const c of H.crossings) {
+      const o = byId.get(c.satId), rec = satellite.twoline2satrec(o.l1, o.l2);
+      for (const t of [c.tEnterMs, c.tCaMs, c.tExitMs]) {
+        const d = new Date(t), site = F.siteTemeKm(pH.site, d, 0);
+        const topo = astrometricTopo(rec, d, site);
+        if (!topo) continue;
+        const el = Math.asin((topo.x * site.x + topo.y * site.y + topo.z * site.z) /
+          (Math.hypot(topo.x, topo.y, topo.z) * Math.hypot(site.x, site.y, site.z))) * F.R2D;
+        lowest = Math.min(lowest, el); n++;
+      }
+    }
+    ok('the low field finds crossings (else vacuous)', H.crossings.length > 20, `(${H.crossings.length})`);
+    ok('entry, closest approach and exit are all at or above the horizon',
+      lowest > -0.01, `lowest ${lowest.toFixed(3)} deg over ${n} instants`);
   }
 
   // ------------------------------------------------------------------ test c

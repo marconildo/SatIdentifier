@@ -40,6 +40,10 @@ import urllib.parse
 import urllib.request
 
 VIZIER_URL = "https://vizier.cds.unistra.fr/viz-bin/asu-tsv"
+# Mirrors, tried in order by the (small) Hipparcos fetch: on 2026-11-15 the CDS
+# host answered "Page unavailable" (404) to every asu-tsv query while the CfA
+# mirror served the same catalogue normally.
+VIZIER_HOSTS = ["vizier.cds.unistra.fr", "vizier.cfa.harvard.edu"]
 # Tycho-2 main catalogue, plus supplement 1 (Hipparcos/Tycho-1 stars absent from the
 # main catalogue). The supplement is NOT optional: Tycho-2's own reduction saturates
 # on the brightest stars, so the main catalogue is missing Sirius, Vega, Arcturus,
@@ -151,6 +155,189 @@ def merge_bright(tycho, bright):
             tycho[best] = (tycho[best][0], tycho[best][1], bmag)
             rephot += 1
     return tycho + extra, rephot, added
+
+
+# ---------------------------------------------------------------------------
+# Bright-star astrometry (round 23)
+#
+# Gaia DR3 does not contain its brightest stars — everything brighter than
+# about G = 3 saturates and is simply absent — so merge_bright() ADDS those
+# stars whole from starcat.js. That file exists for photometry and for an
+# all-sky chart: its positions are J2000 places rounded to 0.01 deg, with no
+# proper motion. Measured in the shipped catalogue against SIMBAD places at
+# its own epoch: Arcturus 63" off, Procyon 36", Sirius 31", Vega 28", Capella
+# 20", Rigel 17" — while every Gaia star around them is good to a fraction of
+# an arcsecond. The brightest stars are exactly the ones the eye anchors a
+# frame on, and on a 1-degree field 63" is nine pixels.
+#
+# Hipparcos (new reduction, van Leeuwen 2007, VizieR I/311/hip2) is complete
+# to V ~ 7.3 and carries milliarcsecond positions and proper motions for every
+# one of them. refine_bright() finds the stars that came whole from starcat.js
+# — recognisable because BOTH coordinates sit on the 0.01-deg lattice — and
+# replaces each position with its Hipparcos place carried to the catalogue's
+# epoch.
+# ---------------------------------------------------------------------------
+
+HIP_SOURCE = "I/311/hip2"
+HIP_EPOCH = 1991.25             # Hipparcos catalogue epoch (ICRS)
+HIP_HP_LIMIT = 5.6              # Hp cut: covers every starcat.js star (V <= 4.6)
+HIP_MATCH_ARCSEC = 75.0         # rounding is <= 25"; margin for wide doubles
+HIP_MAX_DMAG = 1.5              # |Hp - V| guard: Hp ~ V + 0.1, variables wander
+
+
+def fetch_hipparcos(cache_path=None):
+    """TSV text of the Hipparcos bright stars, from the first VizieR host that
+    serves it. Under 200 kB; cached at cache_path when given."""
+    if cache_path and pathlib.Path(cache_path).exists():
+        return pathlib.Path(cache_path).read_text(encoding="utf-8", errors="replace")
+    query = urllib.parse.urlencode({
+        "-source": HIP_SOURCE,
+        "-out": "HIP,RArad,DErad,pmRA,pmDE,Hpmag",
+        "Hpmag": "<%.1f" % HIP_HP_LIMIT,
+        "-out.max": "unlimited",
+    })
+    last = None
+    for host in VIZIER_HOSTS:
+        url = "https://%s/viz-bin/asu-tsv?%s" % (host, query)
+        print("fetching %s" % url, flush=True)
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                text = resp.read(MAX_BYTES).decode("utf-8", "replace")
+        except (urllib.error.URLError, OSError) as e:
+            last = e
+            print("  %s: %s" % (host, e), flush=True)
+            continue
+        if parse_hipparcos(text):
+            if cache_path:
+                pathlib.Path(cache_path).parent.mkdir(parents=True, exist_ok=True)
+                pathlib.Path(cache_path).write_text(text, encoding="utf-8")
+            return text
+        last = RuntimeError("no Hipparcos rows in the reply from %s" % host)
+        print("  %s" % last, flush=True)
+    raise RuntimeError("Hipparcos fetch failed on every VizieR host: %s" % last)
+
+
+def parse_hipparcos(text):
+    """[(raDeg, decDeg, pmRA*cosDE mas/yr, pmDE mas/yr, Hp), ...] at HIP_EPOCH."""
+    out = []
+    for line in text.splitlines():
+        f = line.split("\t")
+        if len(f) < 6:
+            continue
+        try:
+            int(f[0])
+            ra, de, hp = float(f[1]), float(f[2]), float(f[5])
+        except ValueError:
+            continue                      # header, units, rule, or a blank row
+        try:
+            pmra, pmde = float(f[3]), float(f[4])
+        except ValueError:
+            pmra = pmde = 0.0
+        out.append((ra, de, pmra, pmde, hp))
+    return out
+
+
+def hip_place(h, epoch_yr):
+    """Hipparcos star carried linearly to epoch_yr: (raDeg, decDeg)."""
+    dt = epoch_yr - HIP_EPOCH
+    de = h[1] + h[3] * dt / 3.6e6
+    cd = max(1e-6, math.cos(math.radians(h[1])))
+    return ((h[0] + h[2] * dt / 3.6e6 / cd) % 360.0, max(-90.0, min(90.0, de)))
+
+
+def on_lattice(v):
+    """True when v (degrees, possibly round-tripped through float32) is a
+    multiple of 0.01 — the signature of a starcat.js coordinate."""
+    return abs(v * 100.0 - round(v * 100.0)) < 3e-3
+
+
+def refine_bright(stars, hip, epoch_yr):
+    """Give every star that came whole from starcat.js its Hipparcos position
+    at epoch_yr. `stars` is [(ra, dec, v), ...]; returns (stars, fixed, missed)
+    with `missed` the lattice stars no Hipparcos star plausibly matches (left
+    where they were). Idempotent: a refined star is no longer on the lattice.
+    """
+    hsort = sorted(hip, key=lambda h: h[1])
+    hdecs = [h[1] for h in hsort]
+    band = HIP_MATCH_ARCSEC / 3600.0 * 1.5
+    out, fixed, missed = [], 0, []
+    for ra, dec, v in stars:
+        if v > BRIGHT_TAKEOVER_MAG + 0.05 or not (on_lattice(ra) and on_lattice(dec)):
+            out.append((ra, dec, v))
+            continue
+        lo = bisect.bisect_left(hdecs, dec - band)
+        hi = bisect.bisect_right(hdecs, dec + band)
+        best, best_d = None, None
+        for h in hsort[lo:hi]:
+            if abs(h[4] - v) > HIP_MAX_DMAG:
+                continue
+            hra, hde = hip_place(h, 2000.0)       # starcat.js places are J2000
+            d = sep_arcsec(ra, dec, hra, hde)
+            if d <= HIP_MATCH_ARCSEC and (best is None or d < best_d):
+                best, best_d = h, d
+        if best is None:
+            missed.append((ra, dec, v))
+            out.append((ra, dec, v))
+            continue
+        nra, nde = hip_place(best, epoch_yr)
+        out.append((nra, nde, v))
+        fixed += 1
+    return out, fixed, missed
+
+
+def read_str1(path):
+    """(stars, magLimit) from an STR1 file — the inverse of write_tile()."""
+    b = pathlib.Path(path).read_bytes()
+    if b[:4] != b"STR1":
+        raise RuntimeError("%s is not an STR1 file" % path)
+    n = struct.unpack_from("<I", b, 4)[0]
+    lim = struct.unpack_from("<f", b, 8)[0]
+    ra = struct.unpack_from("<%df" % n, b, 12)
+    de = struct.unpack_from("<%df" % n, b, 12 + 4 * n)
+    mg = struct.unpack_from("<%dh" % n, b, 12 + 8 * n)
+    return [(ra[i], de[i], mg[i] / 100.0) for i in range(n)], lim
+
+
+def refine_file(path, hip, epoch_yr):
+    """refine_bright() on an existing STR1 file, in place (atomic). Returns
+    (fixed, missed); the file is rewritten only when something moved."""
+    stars, lim = read_str1(path)
+    stars, fixed, missed = refine_bright(stars, hip, epoch_yr)
+    if fixed:
+        stars.sort(key=lambda s: s[1])            # the frontend binary-searches dec
+        tmp = pathlib.Path(str(path) + ".tmp")
+        write_tile(stars, tmp, lim)
+        tmp.replace(path)
+    return fixed, missed
+
+
+def refine_existing(assets, tile_dir, cache_dir):
+    """--refine-bright: repair catalogues already on disk (round 23)."""
+    cache = pathlib.Path(cache_dir) / "hip2_bright.tsv" if cache_dir else None
+    hip = parse_hipparcos(fetch_hipparcos(cache))
+    print("hipparcos: %d stars to Hp %.1f" % (len(hip), HIP_HP_LIMIT), flush=True)
+    for path, epoch in assets:
+        if not pathlib.Path(path).exists():
+            continue
+        fixed, missed = refine_file(path, hip, epoch)
+        print("%s (epoch %.1f): %d bright stars moved to their Hipparcos places, "
+              "%d left as they were" % (path, epoch, fixed, len(missed)), flush=True)
+        for ra, dec, v in missed[:12]:
+            print("    no Hipparcos match: ra %.2f dec %+.2f V %.1f" % (ra, dec, v))
+    tdir = pathlib.Path(tile_dir)
+    idx = tdir / "index.json"
+    if idx.exists():
+        epoch = json.loads(idx.read_text(encoding="utf-8")).get("epochYr", TARGET_EPOCH)
+        tot, touched, nmiss = 0, 0, 0
+        for t in sorted(tdir.glob("t*_*.bin")):
+            fixed, missed = refine_file(t, hip, epoch)
+            tot += fixed
+            touched += 1 if fixed else 0
+            nmiss += len(missed)
+        print("%s (epoch %.2f): %d bright stars moved in %d tiles, %d left as they were"
+              % (tdir, epoch, tot, touched, nmiss), flush=True)
+    return 0
 
 
 def dedupe(stars, radius_arcsec=2.0):
@@ -524,6 +711,12 @@ def build_deep_tiles(out_dir, bright_path, vmax):
     # the tile that contains it.
     bright = load_bright(bright_path) if pathlib.Path(bright_path).exists() else []
     all_tiles = list(deep_tiles())
+    try:
+        hip = parse_hipparcos(fetch_hipparcos(out / "hip2_bright.tsv"))
+    except (RuntimeError, OSError) as e:
+        hip = None
+        print("WARNING: bright-star positions will NOT be refined (%s); rerun with "
+              "--refine-bright afterwards" % e, file=sys.stderr)
 
     for slab in range(9):
         b_lo, b_hi = slab * 5, slab * 5 + 5
@@ -549,6 +742,9 @@ def build_deep_tiles(out_dir, bright_path, vmax):
                    and (ra1 - ra0 >= 360 or (ra0 - m <= s[0] <= ra1 + m))]
             if sub:
                 rows, rephot, added = merge_bright(rows, sub)
+                if hip:
+                    rows, _, _ = refine_bright(rows, hip, epoch_yr)
+                    rows.sort(key=lambda s: s[1])
             n, nbytes = write_tile(rows, out / name, vmax)
             print("    %s: %d stars, %.1f kB" % (name, n, nbytes / 1e3), flush=True)
 
@@ -736,7 +932,19 @@ def main():
     ap.add_argument("--deep-tiles", action="store_true",
                     help="build the deep tile set (default out: data/deepstars/, "
                          "gitignored; V <= 13; resumable — rerun to continue)")
+    ap.add_argument("--refine-bright", action="store_true",
+                    help="repair the catalogues already on disk: move the brightest "
+                         "stars (absent from Gaia, taken whole from starcat.js at "
+                         "0.01-deg J2000 places) to their Hipparcos positions at each "
+                         "catalogue's epoch — the two bundled assets and the deep "
+                         "tile set. In place, idempotent, one ~200 kB download")
     args = ap.parse_args()
+
+    if args.refine_bright:
+        assets = SCRIPT_DIR.parent / "app" / "assets"
+        return refine_existing(
+            [(assets / "stars_deep.bin", TARGET_EPOCH), (assets / "stars_m9.bin", 2000.0)],
+            SCRIPT_DIR.parent / "data" / "deepstars", args.cache_dir)
 
     if args.deep_tiles:
         vmax = args.vmax if args.vmax else DEEP_MAG_LIMIT
@@ -807,6 +1015,19 @@ def finish(stars, args):
         stars, rephot, added = merge_bright(stars, bright)
         print("merged %d BSC5 bright stars: %d re-photometered in place, %d added whole"
               % (len(bright), rephot, added), flush=True)
+        # The stars added whole carry starcat.js's 0.01-deg J2000 places; give
+        # them real astrometry (see "Bright-star astrometry" above).
+        epoch = TARGET_EPOCH if args.source == "gaia" else 2000.0
+        try:
+            cache = pathlib.Path(args.cache_dir) / "hip2_bright.tsv" if args.cache_dir else None
+            hip = parse_hipparcos(fetch_hipparcos(cache))
+            stars, fixed, missed = refine_bright(stars, hip, epoch)
+            print("refined %d bright-star positions from Hipparcos (epoch %.1f), "
+                  "%d unmatched" % (fixed, epoch, len(missed)), flush=True)
+        except (RuntimeError, OSError) as e:
+            print("WARNING: bright-star positions NOT refined (%s) — the brightest "
+                  "stars keep starcat.js's rounded J2000 places; rerun with "
+                  "--refine-bright" % e, file=sys.stderr)
     else:
         print("WARNING: %s not found — bright-star magnitudes will be Tycho-derived"
               % bright_path, file=sys.stderr)

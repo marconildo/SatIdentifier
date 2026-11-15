@@ -14,6 +14,7 @@
   const F = SAT.frames;
   const D2R = Math.PI / 180, R2D = 180 / Math.PI;
   const OMEGA_E = 7.292115146706979e-5;   // Earth rotation rate, rad/s
+  const C_KM_S = 299792.458;          // light time — see look()
 
   const Re = 6378.137;                     // equatorial, km
   const Rp = 6356.752314245;               // polar, km
@@ -147,6 +148,18 @@
     const rho = {
       x: pv.r.x - siteTeme.x, y: pv.r.y - siteTeme.y, z: pv.r.z - siteTeme.z,
     };
+    // Light time (round 22): the satellite is seen where it WAS when the light
+    // left it, rho/c ago — v*rho/c back along its track, 5" for LEO at 1000 km
+    // and 2" for GEO. First order is exact to a micrometre here. This makes the
+    // reported direction the ASTROMETRIC place — the one a plate solution
+    // against catalogue stars measures. Aberration is deliberately NOT applied:
+    // it displaces the satellite and the stars around it alike, and the star
+    // chart is unaberrated. {lightTime:false} gives the geometric direction,
+    // which is what satellite.js's own look angles are (tests only).
+    if (o.lightTime !== false) {
+      const tau = Math.sqrt(rho.x * rho.x + rho.y * rho.y + rho.z * rho.z) / C_KM_S;
+      rho.x -= pv.v.x * tau; rho.y -= pv.v.y * tau; rho.z -= pv.v.z * tau;
+    }
     const rhoDot = {
       x: pv.v.x - siteVel.x, y: pv.v.y - siteVel.y, z: pv.v.z - siteVel.z,
     };

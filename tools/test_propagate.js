@@ -139,7 +139,8 @@ console.log('\n[4] consistency with the frames cross-check');
   let worst = 0, n = 0;
   for (let k = 0; k < 300; k++) {
     const d = new Date(Date.UTC(2026, 6, 21, 0, 0, 97 * k));
-    const L = P.look(site, ISS, d, { refraction: false });
+    // geometric direction on both sides: satellite.js applies no light time
+    const L = P.look(site, ISS, d, { refraction: false, lightTime: false });
     if (!L || L.elDeg < 5) continue;
     const pv = satellite.propagate(P.ensureSatrec(ISS) && ISS._satrec, d);
     const la = satellite.ecfToLookAngles(
@@ -151,6 +152,49 @@ console.log('\n[4] consistency with the frames cross-check');
   }
   console.log(`  (${n} above-horizon samples)`);
   check('worst elevation/range disagreement', worst, 0, 0.01, 'arcsec or km');
+}
+
+console.log('\n[4b] light time: look() reports the astrometric place');
+{
+  // The satellite is seen where it was rho/c ago. Independent version: propagate
+  // the satellite to the retarded instant (iterated), subtract the site at the
+  // RECEPTION instant, rotate to J2000. The displacement itself is v_perp/c —
+  // ~5" for LEO whatever the range, ~2" for GEO.
+  const usSite = { latDeg: 38.9, lonDeg: -77.0, altM: 100 };
+  let worst = 0, n = 0, maxShiftLeo = 0, maxShiftGeo = 0;
+  for (const [obj, st] of [[ISS, site], [GEO, usSite]]) {
+    P.ensureSatrec(obj);
+    for (let k = 0; k < 400; k++) {
+      const d = new Date(Date.UTC(2026, 6, 21, 0, 0, 97 * k));
+      const L = P.look(st, obj, d, { refraction: false });
+      const G = P.look(st, obj, d, { refraction: false, lightTime: false });
+      if (!L || !G || G.elDeg < 5) continue;
+      const sT = F.siteTemeKm(st, d, 0);
+      let topo = null, rho = 0;
+      for (let it = 0; it < 3; it++) {
+        const tRet = d.getTime() - rho / 299792.458 * 1000;
+        const whole = Math.floor(tRet), rem = (tRet - whole) / 1000;
+        const pv = satellite.propagate(obj._satrec, new Date(whole));
+        topo = { x: pv.position.x + pv.velocity.x * rem - sT.x,
+          y: pv.position.y + pv.velocity.y * rem - sT.y,
+          z: pv.position.z + pv.velocity.z * rem - sT.z };
+        rho = Math.hypot(topo.x, topo.y, topo.z);
+      }
+      const rd = F.vecToRaDec(F.temeToJ2000(topo, d));
+      worst = Math.max(worst, F.sep(rd.raDeg, rd.decDeg, L.raDeg, L.decDeg) * 3600);
+      const shift = F.sep(G.raDeg, G.decDeg, L.raDeg, L.decDeg) * 3600;
+      if (obj === ISS) maxShiftLeo = Math.max(maxShiftLeo, shift);
+      else maxShiftGeo = Math.max(maxShiftGeo, shift);
+      n++;
+    }
+  }
+  console.log(`  (${n} above-horizon samples; largest shift LEO ${maxShiftLeo.toFixed(2)}", GEO ${maxShiftGeo.toFixed(2)}")`);
+  // 0.3": satellite.propagate(Date) resolves the Julian date to ~40 us only
+  check('look() vs an iterated retarded-time recompute', worst, 0, 0.3, 'arcsec');
+  ok('LEO light-time shift is the expected few arcseconds', maxShiftLeo > 3 && maxShiftLeo < 5.6,
+    maxShiftLeo.toFixed(2) + '"');
+  ok('GEO light-time shift is ~2 arcseconds', maxShiftGeo > 1.6 && maxShiftGeo < 2.4,
+    maxShiftGeo.toFixed(2) + '"');
 }
 
 console.log('\n[5] robustness');

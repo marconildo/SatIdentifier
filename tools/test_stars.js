@@ -184,6 +184,66 @@ function fmt(v) {
     }
   }
 
+  console.log('\n[5b] bright-star astrometry in the bundled Gaia catalogue (round 23)');
+  {
+    // Gaia DR3 lacks its brightest stars, so the builder adds them from starcat.js
+    // — whose positions are J2000 places rounded to 0.01 deg, no proper motion.
+    // Until round 23 those went into the catalogue as they were: Arcturus 63" off,
+    // Procyon 36", Sirius 31". They are now carried to the catalogue epoch from
+    // Hipparcos. Truth: SIMBAD ICRS J2000 place + proper motion (mas/yr, pmRA is
+    // mu_alpha*cos(dec)), carried to the same epoch.
+    const DEEP = path.join(__dirname, '..', 'app', 'assets', 'stars_deep.bin');
+    const EPOCH = 2026.5;               // make_starcat.py TARGET_EPOCH
+    const TRUTH = [
+      ['Sirius', 101.28715533, -16.71611586, -546.01, -1223.07],
+      ['Vega', 279.23473479, 38.78368896, 200.94, 286.23],
+      ['Arcturus', 213.91530029, 19.18240916, -1093.39, -2000.06],
+      ['Capella', 79.17232794, 45.99799147, 75.25, -426.89],
+      ['Procyon', 114.82549791, 5.22498756, -714.59, -1036.80],
+      ['Altair', 297.69582730, 8.86832120, 536.23, 385.29],
+      ['Betelgeuse', 88.79293899, 7.40706400, 27.54, 11.30],
+      ['Rigel', 78.63446707, -8.20163836, 1.31, 0.50],
+      ['Polaris', 37.95456067, 89.26410897, 44.48, -11.85],
+      ['Deneb', 310.35797975, 45.28033881, 2.01, 1.85],
+      // Gaia's own stars, as a control: these were always right
+      ['61 Cyg A', 316.72474792, 38.74941667, 4164.17, 3249.99],
+      ['Barnard\'s star', 269.45207825, 4.69336497, -802.80, 10362.54],
+    ];
+    let buf = null;
+    try { buf = fs.readFileSync(DEEP); } catch (e) { buf = null; }
+    ok('bundled Gaia catalogue present (stars_deep.bin)', !!buf);
+    if (buf) {
+      const n = buf.readUInt32LE(4);
+      const ab = buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.length);
+      const ra = new Float32Array(ab, 12, n), dec = new Float32Array(ab, 12 + 4 * n, n);
+      const mag = new Int16Array(ab, 12 + 8 * n, n);
+      const yr = EPOCH - 2000, D = Math.PI / 180;
+      let worst = 0, worstName = '';
+      for (const [name, r0, d0, pmr, pmd] of TRUTH) {
+        const d1 = d0 + pmd * yr / 3.6e6, r1 = r0 + pmr * yr / 3.6e6 / Math.cos(d0 * D);
+        let best = null;
+        for (let i = 0; i < n; i++) {
+          if (Math.abs(dec[i] - d1) > 0.05) continue;
+          const off = Math.hypot((ra[i] - r1) * Math.cos(d1 * D), dec[i] - d1) * 3600;
+          if (off < 120 && (!best || mag[i] < best.m)) best = { off: off, m: mag[i] };
+        }
+        if (!best) { ok(name + ' present', false, 'MISSING'); continue; }
+        if (best.off > worst) { worst = best.off; worstName = name; }
+      }
+      // 1.5": float32 RA (0.08") + the truth table's own linear-motion model
+      ok('the brightest stars are within 1.5" of their true place at the catalogue epoch',
+        worst <= 1.5, `worst ${worst.toFixed(2)}" (${worstName}) over ${TRUTH.length} stars`);
+      let lattice = 0, decSorted = true;
+      const onL = (v) => Math.abs(v * 100 - Math.round(v * 100)) < 3e-3;
+      for (let i = 0; i < n; i++) {
+        if (mag[i] <= 465 && onL(ra[i]) && onL(dec[i])) lattice++;
+        if (i && dec[i] < dec[i - 1]) decSorted = false;
+      }
+      ok('no bright star is left on starcat.js\'s 0.01-deg lattice', lattice === 0, `${lattice} found`);
+      ok('declination is still sorted (the cone query binary-searches it)', decSorted);
+    }
+  }
+
   console.log('\n[6] wrap-around and pole edge cases');
   {
     // A cone straddling RA = 0 must not be cut in half by the bounding-box prefilter.

@@ -30,7 +30,7 @@ import webbrowser
 import zipfile
 from email.utils import formatdate
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 USER_AGENT = "SatIdentifier/0.1"
 FETCH_TIMEOUT = 30            # seconds, all outbound HTTP
 CACHE_FRESH_S = 2 * 3600      # CelesTrak group cache considered fresh below this age
@@ -69,15 +69,23 @@ CELESTRAK_INTDES_URL = "https://celestrak.org/NORAD/elements/gp.php?INTDES={intd
 CELESTRAK_NAME_URL = "https://celestrak.org/NORAD/elements/gp.php?NAME={name}&FORMAT=json"
 SATCAT_URL = "https://celestrak.org/satcat/records.php?CATNR={norad}&FORMAT=JSON"
 SATCAT_BULK_URL = "https://celestrak.org/pub/satcat.csv"
-# Full catalogue without an account (round 21): gp.php has no full-catalogue
-# query, so these are CelesTrak's whole-set bulk files, tried in order.
-# catalog.csv (modern OMM field names, full integer NORAD_CAT_ID) first; the
-# legacy catalog.txt TLE file is the fallback, and by CelesTrak's stated policy
-# it omits the 6-digit objects catalogued after 2026-07-11.
-CELESTRAK_FULL_URLS = [
-    "https://celestrak.org/pub/TLE/catalog.csv",
-    "https://celestrak.org/pub/TLE/catalog.txt",
-]
+# Full catalogue without an account (round 22). gp.php has no all-objects
+# query, and the bulk files round 21 used (/pub/TLE/catalog.csv, catalog.txt)
+# answer 403 from any IP CelesTrak has rate-blocked for them — measured
+# permanent on this network, which shares its exit address. But INTDES matches
+# by PREFIX: a three-digit launch decade ("INTDES=202") returns every object
+# launched in the 2020s. One query per decade since 195x, plus GROUP=analyst
+# for the objects that have no international designator, is the whole
+# catalogue in nine small requests (32 912 objects, 4.7 MB of OMM CSV,
+# measured 2026-11-15), all through the query endpoint the block never touches.
+CELESTRAK_GP_CSV_URL = "https://celestrak.org/NORAD/elements/gp.php?{query}&FORMAT=csv"
+CELESTRAK_FIRST_DECADE = 195
+# CelesTrak checks for new GP data once every 2 hours and (since 2026-03)
+# answers 403 to a repeat of a query it has already served within that update
+# cycle; 50 HTTP errors in 2 hours firewalls the address. So nothing here is
+# ever re-requested inside this window, "Force refresh" included.
+CELESTRAK_UPDATE_S = 2 * 3600
+CELESTRAK_PAUSE_S = 0.5       # between consecutive requests of one load
 QSMAG_URL = "https://www.mmccants.org/programs/qsmag.zip"
 # Rounds 15-16: the chart's deep star field is a LOCAL tile set
 # (data/deepstars/, V <= 13, built once by tools/make_starcat.py --deep-tiles)
@@ -773,59 +781,137 @@ def enrich_full_catalog(tles, notes):
     }
 
 
+def celestrak_full_parts(now=None):
+    """[(part key, gp.php query)] covering the whole catalogue.
+
+    One launch-decade INTDES prefix per decade from the 1950s to the current
+    one — the list grows by itself in 2030 — plus the analyst group, whose
+    objects carry no international designator and so match no decade.
+    """
+    year = time.gmtime(time.time() if now is None else now).tm_year
+    parts = [(f"{d}0s", f"INTDES={d}")
+             for d in range(CELESTRAK_FIRST_DECADE, year // 10 + 1)]
+    parts.append(("analyst", "GROUP=analyst"))
+    return parts
+
+
+def http_error_text(e, limit=220):
+    """The human-readable part of an HTTP error body, tags stripped.
+
+    CelesTrak's 403 pages say exactly why ("GP data has not updated since your
+    last successful download of ...", "excessive downloads ..."), and that
+    sentence is what the user needs — not a bare status code.
+    """
+    try:
+        body = e.read(8192).decode("utf-8", "replace")
+    except Exception:
+        return ""
+    body = re.sub(r"(?is)<(script|style)\b.*?</\1>|<!--.*?-->", " ", body)
+    text = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", body)).strip()
+    # drop the IIS boilerplate that precedes the actual explanation
+    text = re.sub(r"^(?:Server Error\s*)?(?:403 - Forbidden: Access is denied\.?\s*)+",
+                  "", text).strip()
+    return text[:limit]
+
+
+def celestrak_too_soon(cached):
+    """Seconds left before CelesTrak will have new data for this cache entry
+    (0 when it may be re-requested)."""
+    if not cached:
+        return 0
+    left = CELESTRAK_UPDATE_S - (time.time() - cached.get("fetchedUnix", 0))
+    return left if left > 0 else 0
+
+
+def with_note(payload, note):
+    return {**payload, "notes": list(payload.get("notes") or []) + [note]}
+
+
+def celestrak_wait_note(left_s):
+    return (f"CelesTrak updates every 2 h — showing the copy fetched "
+            f"{max(1, round((CELESTRAK_UPDATE_S - left_s) / 60))} min ago")
+
+
 def celestrak_full_payload(refresh=False):
-    """The no-account full catalogue (round 21), cached like catalog_full.
+    """The no-account full catalogue, assembled from gp.php decade queries.
 
-    CelesTrak's gp.php deliberately offers no full-catalogue query, so this
-    walks the whole-set bulk files in CELESTRAK_FULL_URLS: catalog.csv first
-    (modern OMM field names, full integer NORAD_CAT_ID), then the legacy
-    catalog.txt TLE file — which by CelesTrak's stated policy never carries
-    the 6-digit objects catalogued after 2026-07-11, so a catalog.txt-sourced
-    payload says so in `notes`; those recent launches are exactly what an
-    unidentified trail often turns out to be, and Space-Track remains the
-    complete set. Standard cache shape: fresh -> serve; stale + failure ->
-    serve stale; nothing -> ApiError.
+    See CELESTRAK_GP_CSV_URL for why it is built this way. Three rules, all
+    from CelesTrak's usage policy, shape the code:
 
-    The CATALOG_FRESH_S window here is load-bearing politeness, not just
-    economy: CelesTrak temp-blocks an IP that re-downloads a bulk file before
-    its content updates (403, ~2 h cooldown), so the 403 branch names that
-    cooldown instead of leaving a bare status code.
+    - **One download per update.** A query already answered inside the 2 h
+      update cycle is never sent again: the assembled payload is served as-is
+      inside that window even on refresh, and each part is cached on its own
+      (`celestrak_full_parts`), so a load that failed at part 6 resumes at
+      part 6 instead of re-requesting 1-5 into a 403.
+    - **Stop on the first non-200.** No retry, no next part: an error "is not
+      going to change by repeating the request", and errors count toward the
+      firewall threshold. The reason CelesTrak gives is passed to the user.
+    - **Sequential, with a pause.** Nine requests, one at a time.
+
+    Cache shape is the standard one: fresh -> serve; failure with an older
+    copy -> serve it flagged stale, with the reason; nothing -> ApiError.
     """
     key = "celestrak_full"
     cached = cache_read(key)
-    if (cached and not refresh
-            and time.time() - cached.get("fetchedUnix", 0) < CATALOG_FRESH_S):
-        return cached
-    tles, src, errors = [], None, []
-    for url in CELESTRAK_FULL_URLS:
-        name = url.rsplit("/", 1)[-1]
-        try:
-            raw = http_get(url)
-        except urllib.error.HTTPError as e:
-            errors.append(f"{name}: HTTP {e.code}" + (
-                " (CelesTrak rate-block — typically clears ~2 h after bulk "
-                "downloads stop)" if e.code == 403 else ""))
-            continue
-        except Exception as e:
-            errors.append(f"{name}: {e}")
-            continue
-        text = raw.decode("utf-8", "replace")
-        got = parse_omm_csv(text) if name.endswith(".csv") else parse_tles(text)
-        if got:
-            tles, src = got, name
-            break
-        errors.append(f"{name}: no elements parsed")
-    if not tles:
+    if cached:
+        age = time.time() - cached.get("fetchedUnix", 0)
+        if not refresh and age < CATALOG_FRESH_S:
+            return cached
+        left = celestrak_too_soon(cached)
+        if left:
+            return with_note(cached, celestrak_wait_note(left))
+
+    store = cache_read("celestrak_full_parts") or {}
+    parts = store.get("parts") if isinstance(store.get("parts"), dict) else {}
+    wanted = celestrak_full_parts()
+    tles, error, fetched_any = [], None, False
+    for name, query in wanted:
+        part = parts.get(name)
+        if not (part and part.get("query") == query and celestrak_too_soon(part)):
+            if fetched_any:
+                time.sleep(CELESTRAK_PAUSE_S)
+            try:
+                raw = http_get(CELESTRAK_GP_CSV_URL.format(query=query))
+            except urllib.error.HTTPError as e:
+                why = http_error_text(e)
+                error = f"{query}: HTTP {e.code}" + (f" — {why}" if why else "")
+                break
+            except Exception as e:
+                error = f"{query}: {e}"
+                break
+            fetched_any = True
+            text = raw.decode("utf-8", "replace")
+            got = parse_omm_csv(text)
+            if not got and "No GP data found" not in text:
+                error = f"{query}: unexpected reply — {text[:120].strip()!r}"
+                break
+            part = {"query": query, "fetchedUnix": time.time(), "tles": got}
+            parts[name] = part
+            cache_write("celestrak_full_parts", {"parts": parts})
+        tles.extend(part["tles"])
+
+    if error:
+        done = sum(1 for name, _ in wanted if name in parts)
+        msg = (f"CelesTrak full catalogue stopped at {error} "
+               f"({done} of {len(wanted)} parts are saved and will not be "
+               f"re-requested; try again later rather than repeating)")
         if cached:
-            return {**cached, "stale": True}
-        raise ApiError(502, "CelesTrak full catalogue fetch failed — "
-                            + "; ".join(errors))
+            return with_note({**cached, "stale": True}, msg)
+        raise ApiError(502, msg)
+
+    seen, unique = set(), []
+    for t in tles:                      # a decade and the analyst group never
+        if t["norad"] not in seen:      # overlap; this is belt and braces
+            seen.add(t["norad"])
+            unique.append(t)
     notes = []
-    if src == "catalog.txt":
-        notes.append("legacy TLE file: objects catalogued after 2026-07-11 "
-                     "(NORAD >= 100000) are absent — Space-Track carries them")
-    counts = enrich_full_catalog(tles, notes)
-    payload = make_payload(f"celestrak:{src}", tles)
+    counts = enrich_full_catalog(unique, notes)
+    payload = make_payload("celestrak:gp by launch decade", unique)
+    # the payload is as old as its OLDEST part: that is what bounds the next
+    # permitted re-request, and what the freshness display should trust
+    payload["fetchedUnix"] = min(parts[name]["fetchedUnix"] for name, _ in wanted)
+    payload["fetched"] = time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                       time.gmtime(payload["fetchedUnix"]))
     payload.update(counts)
     payload["cacheKey"] = key
     if notes:
@@ -986,10 +1072,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not GROUP_ID_RE.fullmatch(group):
             raise ApiError(400, "Missing or invalid 'group' parameter")
         key = f"celestrak_{group}"
-        refresh = qs.get("refresh") == "1"
         cached = cache_read(key)
-        if (cached and not refresh
-                and time.time() - cached.get("fetchedUnix", 0) < CACHE_FRESH_S):
+        # refresh cannot beat CelesTrak's 2 h update cycle — a repeat inside
+        # it is a 403, not newer data (see CELESTRAK_UPDATE_S)
+        if celestrak_too_soon(cached):
             return self._respond(200, cached)
         url = CELESTRAK_URL.format(group=urllib.parse.quote(group, safe=""))
         try:
@@ -1026,9 +1112,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         key = "celestrak_q_" + hashlib.sha1(
             ("|".join(urls) + "|" + piece).encode("utf-8")).hexdigest()[:12]
         cached = cache_read(key)
-        if (cached and not refresh
-                and time.time() - cached.get("fetchedUnix", 0) < CACHE_FRESH_S):
-            return self._respond(200, cached)
+        left = celestrak_too_soon(cached)
+        if left:    # inside the 2 h update cycle a repeat is a 403, not news
+            return self._respond(200, with_note(cached, celestrak_wait_note(left))
+                                 if refresh else cached)
         records, errors = [], []
         for url in urls:
             try:
@@ -1063,7 +1150,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self._respond(200, payload)
 
     def _celestrak_full(self, qs):
-        """The no-account full catalogue (round 21) — celestrak_full_payload."""
+        """The no-account full catalogue — celestrak_full_payload."""
         self._respond(200, celestrak_full_payload(qs.get("refresh") == "1"))
 
     def _stars_deep(self):

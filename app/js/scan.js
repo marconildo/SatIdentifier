@@ -20,6 +20,13 @@
   // 0.61 us each, i.e. already far past "interactive" even across six workers.
   const MAX_PROPAGATIONS = 60e6;
 
+  // Stage 2 no longer propagates every object at every step (round 22): it skips
+  // each stretch in which the object provably cannot reach the field. Measured on
+  // the 32 912-object catalogue of 2026-11-15, thirteen scenarios from a 1-minute
+  // frame to a 24 h GEO stare, ground and orbit: 3-10% of the fixed grid is
+  // actually propagated. The estimate charges the top of that range.
+  const SKIP_FRACTION = 0.10;
+
   let pool = [];          // [{w, index, loaded, count}]
   let poolWorkers = 0;    // worker count the current pool was built for
   let loadPromise = null;
@@ -157,9 +164,9 @@
   /** Projected propagation count, so the UI can warn BEFORE a huge scan rather than
    *  after the tab has stopped responding.
    *
-   *  This is the pre-cull upper bound: stage 1 typically removes 60-90% of the
-   *  catalogue, but how much depends on the pointing and we do not know it until we
-   *  have run it. Warning on the bound is the honest direction to be wrong in. */
+   *  This is a pre-cull figure: stage 1 removes a further 10-70% of the catalogue,
+   *  but how much depends on the pointing and we do not know it until we have run
+   *  it. Erring high is the honest direction to be wrong in. */
   function estimate(overrides) {
     const obs = Object.assign({}, SAT.state.obs, overrides || {});
     const st = Object.assign(scanSettings(), overrides || {});
@@ -173,7 +180,8 @@
       : Math.max(0.5, st.coarseStepS);
     const spanMin = Math.max(0, obs.spanMin || 0);
     const coarseSteps = Math.round(spanMin * 60 / coarseStepS) + 1;
-    const propagations = objects * coarseSteps;
+    const gridPropagations = objects * coarseSteps;
+    const propagations = Math.round(gridPropagations * SKIP_FRACTION);
     return {
       objects: objects,
       coarseSteps: coarseSteps,
@@ -181,6 +189,7 @@
       spanMin: spanMin,
       workers: workerCount(),
       propagations: propagations,
+      gridPropagations: gridPropagations,
       limit: MAX_PROPAGATIONS,
       tooLarge: propagations > MAX_PROPAGATIONS,
       // 0.61 us per propagation, measured — see CONTRACT.md "Performance decisions"
@@ -191,7 +200,7 @@
   function tooLargeMessage(est) {
     return 'Scan too large: about ' + (est.propagations / 1e6).toFixed(1) +
       ' million propagations (' + est.objects.toLocaleString() + ' objects x ' +
-      est.coarseSteps.toLocaleString() + ' steps), over the ' +
+      est.coarseSteps.toLocaleString() + ' steps, after skipping), over the ' +
       (est.limit / 1e6).toFixed(0) + ' M limit. Raise coarseStepS (now ' +
       est.coarseStepS + ' s) or shorten spanMin (now ' + est.spanMin + ' min).';
   }
@@ -291,12 +300,15 @@
       sc.stale = false;
       sc.params = params;
       sc.culled = merged.culled;
+      sc.propagations = merged.propagations;
+      sc.gridPropagations = merged.gridPropagations;
       sc.truncated = merged.truncated;
 
       running = null;
       SAT.bus.emit('scan-done', {
         count: merged.crossings.length, ms: ms, truncated: merged.truncated,
         culled: merged.culled, propagations: merged.propagations,
+        gridPropagations: merged.gridPropagations, timing: merged.timing,
       });
       return merged.crossings;
     } catch (err) {
@@ -328,11 +340,15 @@
     const culled = {
       total: 0, bad: 0, stage1: 0, stage2: 0, stage3: 0, survivors: 0, candidates: 0,
     };
-    let propagations = 0;
+    let propagations = 0, gridPropagations = 0;
+    // per-stage CPU time summed over the workers (not wall clock)
+    const timing = { stage1Ms: 0, stage2Ms: 0, stage3Ms: 0 };
     let all = [];
     results.forEach((r) => {
       if (r.culled) Object.keys(culled).forEach((k) => { culled[k] += (r.culled[k] || 0); });
       propagations += r.propagations || 0;
+      gridPropagations += r.gridPropagations || 0;
+      if (r.timing) Object.keys(timing).forEach((k) => { timing[k] += (r.timing[k] || 0); });
       all = all.concat(r.crossings || []);
     });
 
@@ -366,6 +382,7 @@
     if (truncated) all = all.slice(0, maxCrossings);
     return {
       crossings: all, culled: culled, truncated: truncated, propagations: propagations,
+      gridPropagations: gridPropagations, timing: timing,
     };
   }
 

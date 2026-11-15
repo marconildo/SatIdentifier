@@ -692,7 +692,11 @@
     function updateEstimate() {
       if (st.running || !SAT.scan || !SAT.scan.estimate) { estEl.textContent = ''; return; }
       let n = 0;
-      try { n = SAT.scan.estimate(); } catch (e) { n = 0; }
+      // estimate() returns an object; a bare number is tolerated for old stubs
+      try {
+        const e = SAT.scan.estimate();
+        n = (e && typeof e === 'object') ? e.propagations : e;
+      } catch (e) { n = 0; }
       estEl.textContent = n > 0 ? '≈ ' + grp(Math.round(n / 1000)) + 'k props' : '';
       estEl.title = 'estimated SGP4 propagations for the current span and step';
     }
